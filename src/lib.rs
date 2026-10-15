@@ -15,6 +15,7 @@ mod gtk_tests {
     #[test]
     fn all_gtk_checks() {
         if gtk::init().is_err() || adw::init().is_err() {
+            eprintln!("GTK indisponible : vérifications GTK ignorées");
             return;
         }
         crate::editor::convert::tests::roundtrip();
@@ -22,5 +23,9 @@ mod gtk_tests {
         crate::document_page::tests::page_basics();
         crate::ui::format_bar::tests::gtk_checks();
         crate::ui::search_bar::tests::gtk_search_bar();
+        crate::editor::table::tests::gtk_table();
+        crate::ui::advanced_bar::tests::bar_builds();
+        crate::ui::stats_dialog::tests::dialog_builds();
+        crate::ui::special_chars::tests::gtk_checks();
     }
 }

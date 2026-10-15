@@ -12,8 +12,8 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
 
 use crate::document::{
-    Alignment, CharStyle, Document, ListKind, Metadata, Paragraph, ParagraphStyle, Rgb, Run,
-    VerticalAlign,
+    Alignment, Block, CharStyle, Document, ListKind, Metadata, Paragraph, ParagraphStyle, Rgb,
+    Run, Table, TableCell, TableRow, VerticalAlign,
 };
 use crate::formats::FormatError;
 
@@ -23,6 +23,10 @@ const MAX_PART_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SPACES: usize = 10_000;
 /// Maximum depth followed in style inheritance chains.
 const MAX_STYLE_DEPTH: usize = 32;
+/// Cap for `table:number-columns-repeated` on cells.
+const MAX_CELL_REPEAT: usize = 64;
+/// Cap for `table:number-rows-repeated` on rows.
+const MAX_ROW_REPEAT: usize = 1000;
 
 /// Parses an .odt file (zip archive) into a [`Document`].
 pub fn read(bytes: &[u8]) -> Result<Document, FormatError> {
@@ -39,13 +43,13 @@ pub fn read(bytes: &[u8]) -> Result<Document, FormatError> {
     }
     collect_styles(&content, &mut sheet, false)?;
 
-    let paragraphs = parse_body(&content, &sheet)?;
+    let blocks = parse_body(&content, &sheet)?;
     let metadata = match &meta {
         // A broken meta.xml must not prevent opening the document.
         Some(m) => parse_meta(m).unwrap_or_default(),
         None => Metadata::default(),
     };
-    Ok(Document { metadata, paragraphs })
+    Ok(Document { metadata, blocks })
 }
 
 fn read_part<R: Read + std::io::Seek>(
@@ -104,6 +108,8 @@ struct TextProps {
     color: Option<Rgb>,
     /// `Some(None)` = explicitly transparent.
     highlight: Option<Option<Rgb>>,
+    /// Hyperlink target (from an enclosing `text:a`).
+    link: Option<String>,
 }
 
 impl TextProps {
@@ -111,7 +117,7 @@ impl TextProps {
         macro_rules! ov {
             ($($f:ident),*) => { $( if o.$f.is_some() { self.$f = o.$f.clone(); } )* };
         }
-        ov!(bold, italic, underline, strike, vertical, family, size, color, highlight);
+        ov!(bold, italic, underline, strike, vertical, family, size, color, highlight, link);
     }
 
     /// Direct formatting of `self` relative to `base` (baseline subtraction):
@@ -142,6 +148,7 @@ impl TextProps {
         if eff_h != base.highlight.flatten() {
             cs.highlight = eff_h;
         }
+        cs.link = self.link.clone();
         cs
     }
 }
@@ -580,9 +587,36 @@ impl ParaState {
     }
 }
 
+struct CellBuild {
+    paragraphs: Vec<Paragraph>,
+    repeat: usize,
+}
+
+struct RowBuild {
+    cells: Vec<TableCell>,
+    repeat: usize,
+}
+
+/// Outermost table being built (nested tables are flattened into its cells).
+#[derive(Default)]
+struct TableBuild {
+    rows: Vec<TableRow>,
+    row: Option<RowBuild>,
+    cell: Option<CellBuild>,
+}
+
+fn repeat_attr(e: &BytesStart<'_>, key: &str, cap: usize) -> usize {
+    attr(e, key).and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1).clamp(1, cap)
+}
+
 struct Body<'a> {
     sheet: &'a StyleSheet,
-    paragraphs: Vec<Paragraph>,
+    blocks: Vec<Block>,
+    tbl: Option<TableBuild>,
+    /// Nesting depth of `table:table` (0 = not in a table).
+    table_depth: usize,
+    /// List stack of the context surrounding the outermost table.
+    saved_lists: Vec<Option<String>>,
     cur: Option<ParaState>,
     /// Stack of list style names (None when unknown) for nested text:list.
     lists: Vec<Option<String>>,
@@ -593,8 +627,48 @@ struct Body<'a> {
 impl<'a> Body<'a> {
     fn end_paragraph(&mut self) {
         if let Some(p) = self.cur.take() {
-            self.paragraphs.push(p.finish());
+            let p = p.finish();
+            if let Some(cell) = self.tbl.as_mut().and_then(|t| t.cell.as_mut()) {
+                cell.paragraphs.push(p);
+            } else {
+                self.blocks.push(Block::Paragraph(p));
+            }
         }
+    }
+
+    fn end_cell(&mut self) {
+        self.end_paragraph();
+        let Some(t) = self.tbl.as_mut() else { return };
+        let Some(cell) = t.cell.take() else { return };
+        let mut paragraphs = cell.paragraphs;
+        if paragraphs.len() == 1 && paragraphs[0] == Paragraph::default() {
+            paragraphs.clear();
+        }
+        let row = t.row.get_or_insert_with(|| RowBuild { cells: Vec::new(), repeat: 1 });
+        for _ in 0..cell.repeat {
+            row.cells.push(TableCell { paragraphs: paragraphs.clone() });
+        }
+    }
+
+    fn end_row(&mut self) {
+        self.end_cell();
+        let Some(t) = self.tbl.as_mut() else { return };
+        if let Some(row) = t.row.take() {
+            for _ in 0..row.repeat {
+                t.rows.push(TableRow { cells: row.cells.clone() });
+            }
+        }
+    }
+
+    fn end_table(&mut self) {
+        self.end_row();
+        if let Some(t) = self.tbl.take() {
+            let mut table = Table { rows: t.rows };
+            table.make_rectangular();
+            self.blocks.push(Block::Table(table));
+        }
+        self.table_depth = 0;
+        self.lists = std::mem::take(&mut self.saved_lists);
     }
 
     fn begin_paragraph(&mut self, e: &BytesStart<'_>, heading: bool) {
@@ -646,6 +720,39 @@ impl<'a> Body<'a> {
             "text:note" | "office:annotation" | "text:tracked-changes" | "text:ruby-text"
             | "text:number" | "office:forms" => self.skip = 1,
             n if n.starts_with("draw:") => self.skip = 1,
+            "table:table" => {
+                self.table_depth += 1;
+                if self.table_depth == 1 {
+                    self.end_paragraph();
+                    self.tbl = Some(TableBuild::default());
+                    self.saved_lists = std::mem::take(&mut self.lists);
+                }
+            }
+            "table:table-row" if self.table_depth == 1 => {
+                self.end_row();
+                if let Some(t) = self.tbl.as_mut() {
+                    let repeat = repeat_attr(e, "table:number-rows-repeated", MAX_ROW_REPEAT);
+                    t.row = Some(RowBuild { cells: Vec::new(), repeat });
+                }
+            }
+            "table:table-cell" if self.table_depth == 1 => {
+                self.end_cell();
+                if let Some(t) = self.tbl.as_mut() {
+                    let repeat = repeat_attr(e, "table:number-columns-repeated", MAX_CELL_REPEAT);
+                    t.cell = Some(CellBuild { paragraphs: Vec::new(), repeat });
+                }
+            }
+            "table:covered-table-cell" if self.table_depth == 1 => {
+                self.end_cell();
+                let repeat = repeat_attr(e, "table:number-columns-repeated", MAX_CELL_REPEAT);
+                if let Some(t) = self.tbl.as_mut() {
+                    let row = t.row.get_or_insert_with(|| RowBuild { cells: Vec::new(), repeat: 1 });
+                    for _ in 0..repeat {
+                        row.cells.push(TableCell::default());
+                    }
+                }
+                self.skip = 1;
+            }
             "text:list" => {
                 let style = attr(e, "text:style-name")
                     .filter(|s| !s.is_empty())
@@ -660,6 +767,11 @@ impl<'a> Body<'a> {
                     let mut cs = p.current().clone();
                     if let Some(sn) = attr(e, "text:style-name") {
                         cs.overlay(&sheet.resolve_text("text", &sn));
+                    }
+                    if name == "text:a" {
+                        if let Some(href) = attr(e, "xlink:href").filter(|h| !h.is_empty()) {
+                            cs.link = Some(href);
+                        }
                     }
                     p.spans.push(cs);
                 }
@@ -696,6 +808,14 @@ impl<'a> Body<'a> {
             "text:list" => {
                 self.lists.pop();
             }
+            "table:table-cell" if self.table_depth == 1 => self.end_cell(),
+            "table:table-row" if self.table_depth == 1 => self.end_row(),
+            "table:table" if self.table_depth > 0 => {
+                self.table_depth -= 1;
+                if self.table_depth == 0 {
+                    self.end_table();
+                }
+            }
             "text:p" | "text:h" => self.end_paragraph(),
             "text:span" | "text:a" => {
                 if let Some(p) = self.cur.as_mut() {
@@ -716,9 +836,18 @@ impl<'a> Body<'a> {
     }
 }
 
-fn parse_body(xml: &str, sheet: &StyleSheet) -> Result<Vec<Paragraph>, FormatError> {
+fn parse_body(xml: &str, sheet: &StyleSheet) -> Result<Vec<Block>, FormatError> {
     let mut reader = Reader::from_str(xml);
-    let mut body = Body { sheet, paragraphs: Vec::new(), cur: None, lists: Vec::new(), skip: 0 };
+    let mut body = Body {
+        sheet,
+        blocks: Vec::new(),
+        tbl: None,
+        table_depth: 0,
+        saved_lists: Vec::new(),
+        cur: None,
+        lists: Vec::new(),
+        skip: 0,
+    };
     loop {
         match reader.read_event()? {
             Event::Start(e) => body.open(name_of(e.name()), &e),
@@ -745,7 +874,10 @@ fn parse_body(xml: &str, sheet: &StyleSheet) -> Result<Vec<Paragraph>, FormatErr
         }
     }
     body.end_paragraph();
-    Ok(body.paragraphs)
+    if body.tbl.is_some() {
+        body.end_table();
+    }
+    Ok(body.blocks)
 }
 
 // ---------------------------------------------------------------------------
@@ -850,13 +982,21 @@ mod tests {
         doc("", body, "")
     }
 
+    fn paras(d: &Document) -> Vec<&Paragraph> {
+        d.paragraphs().collect()
+    }
+
+    fn cell_texts(t: &Table) -> Vec<Vec<String>> {
+        t.rows.iter().map(|r| r.cells.iter().map(|c| c.plain_text()).collect()).collect()
+    }
+
     #[test]
     fn plain_paragraphs() {
         let d = simple("<text:p>Bonjour</text:p><text:p/><text:p>Monde</text:p>");
-        assert_eq!(d.paragraphs.len(), 3);
-        assert_eq!(d.paragraphs[0].plain_text(), "Bonjour");
-        assert!(d.paragraphs[1].runs.is_empty());
-        assert_eq!(d.paragraphs[2].runs, vec![Run::plain("Monde")]);
+        assert_eq!(paras(&d).len(), 3);
+        assert_eq!(paras(&d)[0].plain_text(), "Bonjour");
+        assert!(paras(&d)[1].runs.is_empty());
+        assert_eq!(paras(&d)[2].runs, vec![Run::plain("Monde")]);
     }
 
     #[test]
@@ -868,7 +1008,7 @@ mod tests {
             r#"<text:p>a <text:span text:style-name="B">b<text:span text:style-name="I">c</text:span></text:span> d<text:span text:style-name="B"></text:span></text:p>"#,
             "",
         );
-        let runs = &d.paragraphs[0].runs;
+        let runs = &paras(&d)[0].runs;
         assert_eq!(runs.len(), 4);
         assert_eq!(runs[0], Run::plain("a "));
         assert!(runs[1].style.bold && !runs[1].style.italic);
@@ -886,8 +1026,8 @@ mod tests {
             r#"<text:p><text:span text:style-name="B">a</text:span><text:span text:style-name="B">b</text:span></text:p>"#,
             "",
         );
-        assert_eq!(d.paragraphs[0].runs.len(), 1);
-        assert_eq!(d.paragraphs[0].runs[0].text, "ab");
+        assert_eq!(paras(&d)[0].runs.len(), 1);
+        assert_eq!(paras(&d)[0].runs[0].text, "ab");
     }
 
     #[test]
@@ -895,7 +1035,7 @@ mod tests {
         let d = simple(
             r#"<text:h text:outline-level="1">A</text:h><text:h text:outline-level="2">B</text:h><text:h text:outline-level="3">C</text:h><text:h text:outline-level="5">D</text:h>"#,
         );
-        let s: Vec<_> = d.paragraphs.iter().map(|p| p.style).collect();
+        let s: Vec<_> = paras(&d).iter().map(|p| p.style).collect();
         assert_eq!(
             s,
             vec![
@@ -921,7 +1061,7 @@ mod tests {
             r#"<text:p text:style-name="Title">a</text:p><text:p text:style-name="P1">b</text:p><text:p text:style-name="Quotations">c</text:p><text:p text:style-name="Preformatted_20_Text">d</text:p><text:p text:style-name="Heading_20_2">e</text:p><text:p text:style-name="Unknown">f</text:p>"#,
             common,
         );
-        let s: Vec<_> = d.paragraphs.iter().map(|p| p.style).collect();
+        let s: Vec<_> = paras(&d).iter().map(|p| p.style).collect();
         assert_eq!(
             s,
             vec![
@@ -947,14 +1087,14 @@ mod tests {
             r#"<text:p text:style-name="P1">a</text:p><text:p text:style-name="P2">b</text:p><text:p text:style-name="P3">c</text:p><text:p text:style-name="P4">d</text:p>"#,
             common,
         );
-        let a: Vec<_> = d.paragraphs.iter().map(|p| p.alignment).collect();
+        let a: Vec<_> = paras(&d).iter().map(|p| p.alignment).collect();
         assert_eq!(a, vec![Alignment::Center, Alignment::Right, Alignment::Justify, Alignment::Left]);
     }
 
     #[test]
     fn whitespace_collapsing() {
         let d = simple("<text:p>  a   b \n\t c  </text:p>");
-        assert_eq!(d.paragraphs[0].plain_text(), "a b c");
+        assert_eq!(paras(&d)[0].plain_text(), "a b c");
     }
 
     #[test]
@@ -962,15 +1102,15 @@ mod tests {
         let d = simple(
             r#"<text:p>a<text:s text:c="3"/>b<text:tab/>c<text:line-break/>d<text:s/>e</text:p>"#,
         );
-        assert_eq!(d.paragraphs[0].plain_text(), "a   b\tc\u{2028}d e");
+        assert_eq!(paras(&d)[0].plain_text(), "a   b\tc\u{2028}d e");
         let d = simple(r#"<text:p>x <text:span>y</text:span> z</text:p>"#);
-        assert_eq!(d.paragraphs[0].plain_text(), "x y z");
+        assert_eq!(paras(&d)[0].plain_text(), "x y z");
     }
 
     #[test]
     fn entities() {
         let d = simple("<text:p>a &amp; b &lt;c&gt; &#233;&#x41;</text:p>");
-        assert_eq!(d.paragraphs[0].plain_text(), "a & b <c> \u{e9}A");
+        assert_eq!(paras(&d)[0].plain_text(), "a & b <c> \u{e9}A");
     }
 
     #[test]
@@ -982,7 +1122,7 @@ mod tests {
             r#"<text:list text:style-name="L1"><text:list-item><text:p>a</text:p><text:list><text:list-item><text:p>b</text:p></text:list-item></text:list></text:list-item></text:list><text:list text:style-name="L2"><text:list-item><text:p>c</text:p></text:list-item></text:list><text:p>d</text:p>"#,
             "",
         );
-        let l: Vec<_> = d.paragraphs.iter().map(|p| p.list).collect();
+        let l: Vec<_> = paras(&d).iter().map(|p| p.list).collect();
         assert_eq!(
             l,
             vec![Some(ListKind::Bullet), Some(ListKind::Numbered), Some(ListKind::Numbered), None]
@@ -992,7 +1132,7 @@ mod tests {
     #[test]
     fn list_without_style_is_bullet() {
         let d = simple("<text:list><text:list-item><text:p>a</text:p></text:list-item></text:list>");
-        assert_eq!(d.paragraphs[0].list, Some(ListKind::Bullet));
+        assert_eq!(paras(&d)[0].list, Some(ListKind::Bullet));
     }
 
     #[test]
@@ -1005,7 +1145,7 @@ mod tests {
             r#"<text:p text:style-name="P1">a<text:span text:style-name="T1">b</text:span></text:p>"#,
             common,
         );
-        let r = &d.paragraphs[0].runs;
+        let r = &paras(&d)[0].runs;
         assert!(r[0].style.bold && r[0].style.italic);
         assert_eq!(r[0].style.font_size, Some(16.0));
         assert!(!r[1].style.bold && r[1].style.italic);
@@ -1016,7 +1156,7 @@ mod tests {
         let common = r#"<style:style style:name="Strong" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style>"#;
         let auto = r##"<style:style style:name="T1" style:family="text" style:parent-style-name="Strong"><style:text-properties fo:color="#FF0000" fo:background-color="#00ff00"/></style:style>"##;
         let d = doc(auto, r#"<text:p><text:span text:style-name="T1">x</text:span></text:p>"#, common);
-        let s = &d.paragraphs[0].runs[0].style;
+        let s = &paras(&d)[0].runs[0].style;
         assert!(s.bold);
         assert_eq!(s.color, Some(Rgb(255, 0, 0)));
         assert_eq!(s.highlight, Some(Rgb(0, 255, 0)));
@@ -1031,8 +1171,8 @@ mod tests {
             r#"<text:p text:style-name="P">a<text:span text:style-name="T">b</text:span></text:p>"#,
             common,
         );
-        assert_eq!(d.paragraphs[0].runs[0].style.highlight, Some(Rgb(255, 255, 0)));
-        assert_eq!(d.paragraphs[0].runs[1].style.highlight, None);
+        assert_eq!(paras(&d)[0].runs[0].style.highlight, Some(Rgb(255, 255, 0)));
+        assert_eq!(paras(&d)[0].runs[1].style.highlight, None);
     }
 
     #[test]
@@ -1044,7 +1184,7 @@ mod tests {
 </office:automatic-styles><office:body><office:text><text:p><text:span text:style-name="T1">a</text:span><text:span text:style-name="T2">b</text:span></text:p></office:text></office:body></office:document-content>"#
         );
         let d = read(&zip_of(&[("content.xml", content_xml)])).unwrap();
-        let r = &d.paragraphs[0].runs;
+        let r = &paras(&d)[0].runs;
         assert_eq!(r[0].style.font_family.as_deref(), Some("Liberation Serif"));
         assert_eq!(r[0].style.font_size, Some(10.5));
         assert_eq!(r[1].style.font_family.as_deref(), Some("Cantarell"));
@@ -1062,7 +1202,7 @@ mod tests {
         ]);
         let d = read(&z).unwrap();
         // The font of the named body style is the baseline, not direct formatting.
-        assert_eq!(d.paragraphs[0].runs[0].style.font_family, None);
+        assert_eq!(paras(&d)[0].runs[0].style.font_family, None);
     }
 
     #[test]
@@ -1076,7 +1216,7 @@ mod tests {
             .map(|i| format!(r#"<text:span text:style-name="S{i}">{i}</text:span>"#))
             .collect();
         let d = doc(auto, &format!("<text:p>{body}</text:p>"), "");
-        let v: Vec<_> = d.paragraphs[0].runs.iter().map(|r| r.style.vertical).collect();
+        let v: Vec<_> = paras(&d)[0].runs.iter().map(|r| r.style.vertical).collect();
         assert_eq!(
             v,
             vec![
@@ -1090,21 +1230,138 @@ mod tests {
     }
 
     #[test]
-    fn tables_flattened_and_notes_skipped() {
+    fn notes_and_frames_skipped() {
         let d = simple(
-            r#"<table:table><table:table-row><table:table-cell><text:p>c1</text:p></table:table-cell><table:table-cell><text:p>c2</text:p></table:table-cell></table:table-row></table:table>
-<text:p>x<text:note text:note-class="footnote"><text:note-citation>1</text:note-citation><text:note-body><text:p>NOTE</text:p></text:note-body></text:note>y<office:annotation><text:p>ann</text:p></office:annotation><draw:frame><draw:text-box><text:p>box</text:p></draw:text-box></draw:frame>z</text:p>"#,
+            r#"<text:p>x<text:note text:note-class="footnote"><text:note-citation>1</text:note-citation><text:note-body><text:p>NOTE</text:p></text:note-body></text:note>y<office:annotation><text:p>ann</text:p></office:annotation><draw:frame><draw:text-box><text:p>box</text:p></draw:text-box></draw:frame>z</text:p>"#,
         );
-        let t: Vec<_> = d.paragraphs.iter().map(|p| p.plain_text()).collect();
-        assert_eq!(t, vec!["c1", "c2", "xyz"]);
+        let t: Vec<_> = paras(&d).iter().map(|p| p.plain_text()).collect();
+        assert_eq!(t, vec!["xyz"]);
     }
 
     #[test]
-    fn links_and_soft_page_break() {
+    fn table_basic() {
         let d = simple(
-            r#"<text:p>see <text:a xlink:href="http://x" xmlns:xlink="http://www.w3.org/1999/xlink">link</text:a><text:soft-page-break/> end</text:p>"#,
+            r#"<text:p>before</text:p><table:table><table:table-column table:number-columns-repeated="2"/><table:table-row><table:table-cell><text:p>c1</text:p></table:table-cell><table:table-cell><text:p>c2</text:p><text:p>c2b</text:p></table:table-cell></table:table-row><table:table-row><table:table-cell/><table:table-cell><text:p/></table:table-cell></table:table-row></table:table><text:p>after</text:p>"#,
         );
-        assert_eq!(d.paragraphs[0].plain_text(), "see link end");
+        assert_eq!(d.blocks.len(), 3);
+        let t = d.tables().next().unwrap();
+        assert_eq!(cell_texts(t), vec![vec!["c1", "c2\nc2b"], vec!["", ""]]);
+        assert!(t.rows[1].cells[0].paragraphs.is_empty());
+        assert!(t.rows[1].cells[1].paragraphs.is_empty());
+        assert_eq!(paras(&d).len(), 2);
+    }
+
+    #[test]
+    fn table_repeated_header_covered() {
+        let d = simple(
+            r#"<table:table><table:table-header-rows><table:table-row><table:table-cell><text:p>h</text:p></table:table-cell><table:table-cell table:number-columns-repeated="2"><text:p>g</text:p></table:table-cell></table:table-row></table:table-header-rows><table:table-rows><table:table-row table:number-rows-repeated="2"><table:table-cell table:number-columns-repeated="3"><text:p>r</text:p></table:table-cell></table:table-row></table:table-rows><table:table-row><table:table-cell table:number-columns-repeated="2" table:number-columns-spanned="2"><text:p>s</text:p></table:table-cell><table:covered-table-cell table:number-columns-repeated="2"/></table:table-row></table:table>"#,
+        );
+        let t = d.tables().next().unwrap();
+        assert_eq!(
+            cell_texts(t),
+            vec![
+                vec!["h", "g", "g", ""],
+                vec!["r", "r", "r", ""],
+                vec!["r", "r", "r", ""],
+                vec!["s", "s", "", ""],
+            ]
+        );
+    }
+
+    #[test]
+    fn table_repeat_caps_and_ragged() {
+        let d = simple(
+            r#"<table:table><table:table-row table:number-rows-repeated="1048576"><table:table-cell table:number-columns-repeated="16384"/></table:table-row></table:table>"#,
+        );
+        let t = d.tables().next().unwrap();
+        assert_eq!((t.rows.len(), t.rows[0].cells.len()), (MAX_ROW_REPEAT, MAX_CELL_REPEAT));
+        let d = simple(
+            r#"<table:table><table:table-row><table:table-cell><text:p>a</text:p></table:table-cell></table:table-row><table:table-row><table:table-cell/><table:table-cell/><table:table-cell/></table:table-row></table:table>"#,
+        );
+        let t = d.tables().next().unwrap();
+        assert!(t.rows.iter().all(|r| r.cells.len() == 3));
+    }
+
+    #[test]
+    fn empty_table_is_one_by_one() {
+        let d = simple("<table:table/>");
+        let t = d.tables().next().unwrap();
+        assert_eq!((t.rows.len(), t.rows[0].cells.len()), (1, 1));
+    }
+
+    #[test]
+    fn nested_table_flattened_and_lists_in_cells() {
+        let auto = r#"<text:list-style style:name="L2"><text:list-level-style-number text:level="1"/></text:list-style>"#;
+        let d = doc(
+            auto,
+            r#"<text:list><text:list-item><text:p>out</text:p><table:table><table:table-row><table:table-cell><text:p>a</text:p><table:table><table:table-row><table:table-cell><text:p>n1</text:p></table:table-cell><table:table-cell><text:p>n2</text:p></table:table-cell></table:table-row></table:table><text:p>b</text:p></table:table-cell><table:table-cell><text:list text:style-name="L2"><text:list-item><text:p>li</text:p></text:list-item></text:list></table:table-cell></table:table-row></table:table><text:p>in-list</text:p></text:list-item></text:list>"#,
+            "",
+        );
+        assert_eq!(d.blocks.len(), 3);
+        let t = d.tables().next().unwrap();
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0].cells.len(), 2);
+        assert_eq!(t.rows[0].cells[0].plain_text(), "a\nn1\nn2\nb");
+        assert!(t.rows[0].cells[0].paragraphs.iter().all(|p| p.list.is_none()));
+        assert_eq!(t.rows[0].cells[1].paragraphs[0].list, Some(ListKind::Numbered));
+        let ps = paras(&d);
+        assert_eq!(ps[0].list, Some(ListKind::Bullet));
+        assert_eq!(ps[1].plain_text(), "in-list");
+        assert_eq!(ps[1].list, Some(ListKind::Bullet));
+    }
+
+    #[test]
+    fn table_cell_paragraph_styles() {
+        let common = r#"<style:style style:name="Title" style:family="paragraph"/>"#;
+        let d = doc(
+            "",
+            r#"<table:table><table:table-row><table:table-cell><text:p text:style-name="Title">T</text:p><text:h text:outline-level="2">H</text:h></table:table-cell></table:table-row></table:table>"#,
+            common,
+        );
+        let c = &d.tables().next().unwrap().rows[0].cells[0];
+        assert_eq!(c.paragraphs[0].style, ParagraphStyle::Title);
+        assert_eq!(c.paragraphs[1].style, ParagraphStyle::Heading2);
+    }
+
+    #[test]
+    fn unclosed_table_is_kept() {
+        let z = zip_of(&[(
+            "content.xml",
+            content("", "<table:table><table:table-row><table:table-cell><text:p>x</text:p>"),
+        )]);
+        if let Ok(d) = read(&z) {
+            assert!(d.tables().count() <= 1);
+        }
+    }
+
+    #[test]
+    fn links_become_char_style() {
+        let auto = r#"<style:style style:name="B" style:family="text"><style:text-properties fo:font-weight="bold"/></style:style>"#;
+        let d = doc(
+            auto,
+            r#"<text:p xmlns:xlink="http://www.w3.org/1999/xlink">see <text:a xlink:type="simple" xlink:href="http://x?a=1&amp;b=2">link <text:span text:style-name="B">bold</text:span></text:a><text:soft-page-break/> end <text:a xlink:href="http://y">y</text:a></text:p>"#,
+            "",
+        );
+        let r = &paras(&d)[0].runs;
+        assert_eq!(paras(&d)[0].plain_text(), "see link bold end y");
+        assert_eq!(r.len(), 5);
+        assert_eq!(r[0].style.link, None);
+        assert_eq!(r[1].text, "link ");
+        assert_eq!(r[1].style.link.as_deref(), Some("http://x?a=1&b=2"));
+        assert!(!r[1].style.bold);
+        assert!(r[2].style.bold);
+        assert_eq!(r[2].style.link.as_deref(), Some("http://x?a=1&b=2"));
+        assert_eq!(r[3].style.link, None);
+        assert_eq!(r[4].style.link.as_deref(), Some("http://y"));
+    }
+
+    #[test]
+    fn link_inside_table_cell() {
+        let d = simple(
+            r#"<table:table><table:table-row><table:table-cell><text:p><text:a xlink:href="http://z" xmlns:xlink="http://www.w3.org/1999/xlink">z</text:a></text:p></table:table-cell></table:table-row></table:table>"#,
+        );
+        let c = &d.tables().next().unwrap().rows[0].cells[0];
+        assert_eq!(c.paragraphs[0].runs[0].style.link.as_deref(), Some("http://z"));
     }
 
     #[test]
@@ -1139,12 +1396,12 @@ mod tests {
         // Style cycle must terminate.
         let auto = r#"<style:style style:name="A" style:family="paragraph" style:parent-style-name="B"/><style:style style:name="B" style:family="paragraph" style:parent-style-name="A"/>"#;
         let d = doc(auto, r#"<text:p text:style-name="A">x</text:p>"#, "");
-        assert_eq!(d.paragraphs.len(), 1);
+        assert_eq!(paras(&d).len(), 1);
     }
 
     #[test]
     fn huge_space_count_is_capped() {
         let d = simple(r#"<text:p>a<text:s text:c="4000000000"/>b</text:p>"#);
-        assert!(d.paragraphs[0].plain_text().len() <= MAX_SPACES + 2);
+        assert!(paras(&d)[0].plain_text().len() <= MAX_SPACES + 2);
     }
 }

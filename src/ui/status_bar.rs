@@ -61,6 +61,9 @@ mod imp {
         editor: glib::WeakRef<Editor>,
         buffer: glib::WeakRef<gtk::TextBuffer>,
         handlers: Vec<glib::SignalHandlerId>,
+        /// Edits inside table cells don't touch the main buffer: the editor's
+        /// format-changed signal (re-emitted for cells) triggers a recount.
+        editor_handler: Option<glib::SignalHandlerId>,
     }
 
     /// Animated display of one count.
@@ -215,6 +218,11 @@ mod imp {
                 editor: editor.downgrade(),
                 buffer: buffer.downgrade(),
                 handlers,
+                editor_handler: Some(editor.connect_format_changed(glib::clone!(
+                    #[weak]
+                    obj,
+                    move |_| obj.imp().schedule_counts()
+                ))),
             });
             self.update_cursor(&buffer);
             self.refresh_counts();
@@ -222,7 +230,10 @@ mod imp {
 
         /// Removes the handlers connected by `bind` and any pending recount.
         fn unbind(&self) {
-            if let Some(binding) = self.binding.take() {
+            if let Some(mut binding) = self.binding.take() {
+                if let (Some(editor), Some(id)) = (binding.editor.upgrade(), binding.editor_handler.take()) {
+                    editor.disconnect(id);
+                }
                 if let Some(buffer) = binding.buffer.upgrade() {
                     for handler in binding.handlers {
                         buffer.disconnect(handler);

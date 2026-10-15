@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gwords::document::{
-    Alignment, CharStyle, Document, ListKind, Metadata, Paragraph, ParagraphStyle, Rgb, Run,
-    VerticalAlign,
+    Alignment, Block, CharStyle, Document, ListKind, Metadata, Paragraph, ParagraphStyle, Rgb, Run,
+    Table, TableCell, TableRow, VerticalAlign,
 };
 use gwords::formats::{load, read_bytes, save, write_bytes, FileFormat};
 
@@ -36,6 +36,24 @@ fn aligned(alignment: Alignment, runs: Vec<Run>) -> Paragraph {
 
 fn list_item(kind: ListKind, text: &str) -> Paragraph {
     Paragraph { list: Some(kind), runs: vec![plain(text)], ..Default::default() }
+}
+
+fn cell(paragraphs: Vec<Paragraph>) -> TableCell {
+    TableCell { paragraphs }
+}
+
+fn table(rows: Vec<Vec<TableCell>>) -> Block {
+    Block::Table(Table {
+        rows: rows.into_iter().map(|cells| TableRow { cells }).collect(),
+    })
+}
+
+/// A link to `url` with the given text, optionally bold.
+fn link(text: &str, url: &str, bold: bool) -> Run {
+    styled(text, |s| {
+        s.link = Some(url.to_string());
+        s.bold = bold;
+    })
 }
 
 /// Covers every feature the format readers and writers must preserve.
@@ -134,45 +152,80 @@ fn sample_doc() -> Document {
     paragraphs.push(para(ParagraphStyle::Normal, vec![]));
     paragraphs.push(para(ParagraphStyle::Normal, vec![plain("Fin du document.")]));
 
-    Document { metadata, paragraphs }
-}
-
-/// Merges adjacent runs with equal style and drops empty runs.
-fn normalize(mut doc: Document) -> Document {
-    for p in &mut doc.paragraphs {
-        let runs = std::mem::take(&mut p.runs);
-        let mut out: Vec<Run> = Vec::with_capacity(runs.len());
-        for r in runs {
-            if r.text.is_empty() {
-                continue;
-            }
-            match out.last_mut() {
-                Some(last) if last.style == r.style => last.text.push_str(&r.text),
-                _ => out.push(r),
-            }
-        }
-        p.runs = out;
+    Document {
+        metadata,
+        blocks: paragraphs.into_iter().map(Block::Paragraph).collect(),
     }
-    doc
 }
 
-/// Asserts that metadata and paragraphs match, after normalization.
-/// Reports the first differing paragraph by index, with expected and got.
+/// A paragraph, a 3x3 table (bold header, a two-item bullet list, an empty
+/// cell), then a closing paragraph.
+fn table_doc() -> Document {
+    let bullets = cell(vec![
+        list_item(ListKind::Bullet, "Premier point"),
+        list_item(ListKind::Bullet, "Second point"),
+    ]);
+    let header = |text: &str| cell(vec![para(ParagraphStyle::Normal, vec![styled(text, |s| s.bold = true)])]);
+    Document {
+        metadata: Metadata::default(),
+        blocks: vec![
+            Block::Paragraph(para(ParagraphStyle::Normal, vec![plain("Avant le tableau.")])),
+            table(vec![
+                vec![header("Nom"), header("Quantité"), header("Prix")],
+                vec![
+                    cell(vec![para(ParagraphStyle::Normal, vec![plain("Pomme")])]),
+                    cell(vec![para(ParagraphStyle::Normal, vec![plain("3")])]),
+                    cell(vec![para(ParagraphStyle::Normal, vec![plain("1,20 €")])]),
+                ],
+                vec![bullets, TableCell::default(), cell(vec![para(ParagraphStyle::Normal, vec![plain("fin")])])],
+            ]),
+            Block::Paragraph(para(ParagraphStyle::Normal, vec![plain("Après le tableau.")])),
+        ],
+    }
+}
+
+/// Paragraph and table cell links: plain, bold, and inside a table.
+fn link_doc() -> Document {
+    const GNOME: &str = "https://www.gnome.org/?a=1&b=2";
+    Document {
+        metadata: Metadata::default(),
+        blocks: vec![
+            Block::Paragraph(Paragraph {
+                runs: vec![plain("Voir "), link("le site", GNOME, false), plain(" ici")],
+                ..Default::default()
+            }),
+            Block::Paragraph(Paragraph {
+                runs: vec![link("lien gras", GNOME, true)],
+                ..Default::default()
+            }),
+            table(vec![vec![
+                cell(vec![Paragraph {
+                    runs: vec![plain("Cellule "), link("liée", GNOME, false)],
+                    ..Default::default()
+                }]),
+                TableCell::default(),
+            ]]),
+        ],
+    }
+}
+
+/// Asserts that metadata and blocks match, after normalization.
+/// Reports the first differing block by index, with expected and got.
 fn assert_same_document(expected: &Document, got: &Document, ctx: &str) {
     assert_eq!(got.metadata, expected.metadata, "{ctx}: metadata differs");
 
-    let expected = normalize(expected.clone());
-    let got = normalize(got.clone());
+    let expected = expected.normalized();
+    let got = got.normalized();
 
     assert_eq!(
-        got.paragraphs.len(),
-        expected.paragraphs.len(),
-        "{ctx}: paragraph count differs"
+        got.blocks.len(),
+        expected.blocks.len(),
+        "{ctx}: block count differs"
     );
-    for (i, (e, g)) in expected.paragraphs.iter().zip(&got.paragraphs).enumerate() {
+    for (i, (e, g)) in expected.blocks.iter().zip(&got.blocks).enumerate() {
         assert_eq!(
             g, e,
-            "{ctx}: paragraph {i} differs\n  expected: {e:?}\n  got:      {g:?}"
+            "{ctx}: block {i} differs\n  expected: {e:?}\n  got:      {g:?}"
         );
     }
 }
@@ -180,7 +233,7 @@ fn assert_same_document(expected: &Document, got: &Document, ctx: &str) {
 /// Plain text with trailing empty paragraphs removed, so that the trailing
 /// newline convention does not matter.
 fn trimmed_plain_text(doc: &Document) -> String {
-    let mut lines: Vec<String> = doc.paragraphs.iter().map(Paragraph::plain_text).collect();
+    let mut lines: Vec<String> = doc.paragraphs().map(Paragraph::plain_text).collect();
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
@@ -235,7 +288,7 @@ fn metadata_roundtrip(format: FileFormat) {
             title: Some("Titre <é> & \"q\" 'a'".to_string()),
             author: Some("Zoé Dupont".to_string()),
         },
-        paragraphs: vec![para(ParagraphStyle::Normal, vec![plain("Corps")])],
+        blocks: vec![Block::Paragraph(para(ParagraphStyle::Normal, vec![plain("Corps")]))],
     };
     let got = roundtrip(&doc, format);
     assert_eq!(got.metadata.title, doc.metadata.title, "{format:?}: title differs");
@@ -267,6 +320,63 @@ fn cross_format_docx_to_odt() {
 }
 
 #[test]
+fn table_roundtrip_odt() {
+    let doc = table_doc();
+    let got = roundtrip(&doc, FileFormat::Odt);
+    assert_same_document(&doc, &got, "table odt");
+}
+
+#[test]
+fn table_roundtrip_docx() {
+    let doc = table_doc();
+    let got = roundtrip(&doc, FileFormat::Docx);
+    assert_same_document(&doc, &got, "table docx");
+}
+
+#[test]
+fn link_roundtrip_odt() {
+    let doc = link_doc();
+    let got = roundtrip(&doc, FileFormat::Odt);
+    assert_same_document(&doc, &got, "link odt");
+}
+
+#[test]
+fn link_roundtrip_docx() {
+    let doc = link_doc();
+    let got = roundtrip(&doc, FileFormat::Docx);
+    assert_same_document(&doc, &got, "link docx");
+}
+
+#[test]
+fn cross_format_with_tables() {
+    let doc = table_doc();
+
+    let docx_bytes = write_bytes(&doc, FileFormat::Docx).expect("write docx");
+    let doc_from_docx = read_bytes(&docx_bytes, FileFormat::Docx).expect("read docx");
+
+    let odt_bytes = write_bytes(&doc_from_docx, FileFormat::Odt).expect("write odt");
+    let doc_from_odt = read_bytes(&odt_bytes, FileFormat::Odt).expect("read odt");
+
+    assert_same_document(&doc_from_docx, &doc_from_odt, "table docx -> odt");
+    assert_same_document(&doc, &doc_from_odt, "table sample -> docx -> odt");
+}
+
+#[test]
+fn plain_writes_tables_as_tsv() {
+    let doc = table_doc();
+    let bytes = write_bytes(&doc, FileFormat::PlainText).expect("write plain");
+    let out = String::from_utf8(bytes).expect("utf-8 output");
+    assert_eq!(
+        out,
+        "Avant le tableau.\n\
+         Nom\tQuantité\tPrix\n\
+         Pomme\t3\t1,20 €\n\
+         Premier point Second point\t\tfin\n\
+         Après le tableau.\n"
+    );
+}
+
+#[test]
 fn plain_roundtrip() {
     let text = "Première ligne é 日本\n\nTroisième & <ligne>\nDernière 🎉\n";
     let doc = Document::from_plain_text(text);
@@ -285,9 +395,9 @@ fn plain_roundtrip() {
 fn empty_document_roundtrip(format: FileFormat) {
     let got = roundtrip(&Document::default(), format);
     assert!(
-        got.paragraphs.len() <= 1,
-        "{format:?}: empty document read back with {} paragraphs",
-        got.paragraphs.len()
+        got.blocks.len() <= 1,
+        "{format:?}: empty document read back with {} blocks",
+        got.blocks.len()
     );
     assert_eq!(got.plain_text(), "", "{format:?}: empty document has text after roundtrip");
 }
@@ -324,7 +434,10 @@ fn large_document_roundtrip_is_fast() {
             }
         })
         .collect();
-    let doc = Document { metadata: Metadata::default(), paragraphs };
+    let doc = Document {
+        metadata: Metadata::default(),
+        blocks: paragraphs.into_iter().map(Block::Paragraph).collect(),
+    };
 
     for format in [FileFormat::Docx, FileFormat::Odt] {
         let start = Instant::now();
@@ -427,11 +540,16 @@ fn styled_paragraph_alignment_roundtrip() {
         for alignment in [Alignment::Left, Alignment::Center, Alignment::Right, Alignment::Justify] {
             let doc = Document {
                 metadata: Metadata::default(),
-                paragraphs: vec![Paragraph { style, alignment, list: None, runs: vec![Run::plain("Texte")] }],
+                blocks: vec![Block::Paragraph(Paragraph {
+                    style,
+                    alignment,
+                    list: None,
+                    runs: vec![Run::plain("Texte")],
+                })],
             };
             for format in [FileFormat::Odt, FileFormat::Docx] {
                 let back = read_bytes(&write_bytes(&doc, format).unwrap(), format).unwrap();
-                assert_eq!(back.paragraphs, doc.paragraphs, "{format:?} {style:?} {alignment:?}");
+                assert_eq!(back.blocks, doc.blocks, "{format:?} {style:?} {alignment:?}");
             }
         }
     }

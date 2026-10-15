@@ -8,8 +8,8 @@ use quick_xml::events::Event;
 use zip::ZipArchive;
 
 use crate::document::{
-    Alignment, CharStyle, Document, ListKind, Metadata, Paragraph, ParagraphStyle, Rgb, Run,
-    VerticalAlign,
+    Alignment, Block, CharStyle, Document, ListKind, Metadata, Paragraph, ParagraphStyle, Rgb, Run,
+    Table, TableCell, TableRow, VerticalAlign,
 };
 use crate::formats::FormatError;
 
@@ -45,14 +45,26 @@ pub fn read(bytes: &[u8]) -> Result<Document, FormatError> {
         None => None,
     };
 
-    let paragraphs = parse_document(&tokenize(&main)?, &styles, numbering.as_ref());
+    let rels_path = {
+        let (d, f) = match main_path.rfind('/') {
+            Some(i) => (&main_path[..=i], &main_path[i + 1..]),
+            None => ("", main_path.as_str()),
+        };
+        format!("{d}_rels/{f}.rels")
+    };
+    let rels = match read_part(&mut archive, &rels_path)? {
+        Some(b) => parse_hyperlink_rels(&tokenize(&b).unwrap_or_default()),
+        None => HashMap::new(),
+    };
+
+    let blocks = parse_document(&tokenize(&main)?, &styles, numbering.as_ref(), &rels);
 
     let metadata = match read_part(&mut archive, "docProps/core.xml")? {
         Some(b) => parse_core(&tokenize(&b).unwrap_or_default()),
         None => Metadata::default(),
     };
 
-    Ok(Document { metadata, paragraphs })
+    Ok(Document { metadata, blocks })
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +580,89 @@ fn list_kind(numbering: Option<&Numbering>, num_id: &str, ilvl: u32) -> Option<L
 }
 
 // ---------------------------------------------------------------------------
+// Relationships and hyperlink field codes
+// ---------------------------------------------------------------------------
+
+/// Relationship id -> target, for hyperlink relationships of the main part.
+fn parse_hyperlink_rels(events: &[Ev]) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    for ev in events {
+        if let Ev::Start(name, attrs) = ev {
+            if name == "Relationship" {
+                let ty = attr(attrs, "Type").unwrap_or("");
+                let external = attr(attrs, "TargetMode").is_some_and(|v| v.eq_ignore_ascii_case("External"));
+                if ty.ends_with("/hyperlink") || external {
+                    if let (Some(id), Some(t)) = (attr(attrs, "Id"), attr(attrs, "Target")) {
+                        m.insert(id.to_string(), t.to_string());
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Splits a field instruction into words, honouring double quotes.
+fn instr_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut has = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                has = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if has {
+                    out.push(std::mem::take(&mut cur));
+                    has = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has = true;
+            }
+        }
+    }
+    if has {
+        out.push(cur);
+    }
+    out
+}
+
+/// Link target of a `HYPERLINK` field instruction, if it is one.
+fn field_link(instr: &str) -> Option<String> {
+    let words = instr_words(instr);
+    let mut it = words.iter();
+    if !it.next()?.eq_ignore_ascii_case("HYPERLINK") {
+        return None;
+    }
+    let mut url: Option<String> = None;
+    let mut anchor: Option<String> = None;
+    while let Some(w) = it.next() {
+        if w.starts_with('\\') {
+            match w.to_ascii_lowercase().as_str() {
+                "\\l" => anchor = it.next().cloned(),
+                "\\o" | "\\t" => {
+                    it.next();
+                }
+                _ => {}
+            }
+        } else if url.is_none() {
+            url = Some(w.clone());
+        }
+    }
+    match (url, anchor) {
+        (Some(u), Some(a)) if !a.is_empty() => Some(format!("{u}#{a}")),
+        (Some(u), _) if !u.is_empty() => Some(u),
+        (_, Some(a)) if !a.is_empty() => Some(format!("#{a}")),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core properties
 // ---------------------------------------------------------------------------
 
@@ -611,14 +706,14 @@ fn parse_core(events: &[Ev]) -> Metadata {
 // ---------------------------------------------------------------------------
 
 const SKIPPED: &[&str] = &[
-    "drawing", "pict", "object", "del", "moveFrom", "sectPr", "instrText", "delText",
+    "drawing", "pict", "object", "del", "moveFrom", "sectPr", "delText",
     "rPrChange", "pPrChange", "numberingChange", "sectPrChange", "tblPrChange",
 ];
 
 #[derive(Default)]
 struct ParaBuilder {
     ppr: PProps,
-    pending: Vec<(String, RProps)>,
+    pending: Vec<(String, RProps, Option<String>)>,
 }
 
 #[derive(Default)]
@@ -693,10 +788,16 @@ fn finish_paragraph(pb: ParaBuilder, styles: &Styles, numbering: Option<&Numberi
         base.color = d.color;
     }
     let mut runs = Vec::new();
-    for (text, rpr) in pb.pending {
+    for (text, rpr, link) in pb.pending {
         let mut eff = base_full(styles, style_id);
         if let Some(rs) = rpr.style.as_deref() {
+            // The character style of a link (usually "Hyperlink") must not become direct formatting.
+            let (color, underline) = (eff.color, eff.underline);
             styles.apply_style_rpr(rs, &mut eff);
+            if link.is_some() {
+                eff.color = color;
+                eff.underline = underline;
+            }
         }
         rpr.apply(&mut eff);
         let cs = CharStyle {
@@ -709,6 +810,7 @@ fn finish_paragraph(pb: ParaBuilder, styles: &Styles, numbering: Option<&Numberi
             font_size: if eff.font_size != base.font_size { eff.font_size } else { None },
             color: if eff.color != base.color { eff.color } else { None },
             highlight: if eff.highlight != base.highlight { eff.highlight } else { None },
+            link,
         };
         push_run(&mut runs, text, cs);
     }
@@ -716,13 +818,40 @@ fn finish_paragraph(pb: ParaBuilder, styles: &Styles, numbering: Option<&Numberi
     Paragraph { style: pstyle, alignment, list, runs }
 }
 
-fn parse_document(events: &[Ev], styles: &Styles, numbering: Option<&Numbering>) -> Vec<Paragraph> {
-    let mut out = Vec::new();
+#[derive(Default)]
+struct CellBuilder {
+    paragraphs: Vec<Paragraph>,
+    span: usize,
+    vmerge_continue: bool,
+}
+
+#[derive(Default)]
+struct Field {
+    instr: String,
+    link: Option<String>,
+    in_result: bool,
+}
+
+fn parse_document(
+    events: &[Ev],
+    styles: &Styles,
+    numbering: Option<&Numbering>,
+    rels: &HashMap<String, String>,
+) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
     let mut stack: Vec<&str> = Vec::new();
     let mut skip = 0usize;
     let mut para: Option<ParaBuilder> = None;
     let mut run: Option<RunBuilder> = None;
     let mut in_t = false;
+    let mut in_instr = false;
+    let mut hyper: Option<String> = None;
+    let mut fields: Vec<Field> = Vec::new();
+    // Tables: only the outermost one is built, nested content is flattened into its cell.
+    let mut tbl_depth = 0usize;
+    let mut table = Table::default();
+    let mut row: Option<TableRow> = None;
+    let mut cell: Option<CellBuilder> = None;
 
     for ev in events {
         match ev {
@@ -737,6 +866,61 @@ fn parse_document(events: &[Ev], styles: &Styles, numbering: Option<&Numbering>)
                 }
                 let parent = stack.last().copied().unwrap_or("");
                 match name.as_str() {
+                    "tbl" => {
+                        tbl_depth += 1;
+                        if tbl_depth == 1 {
+                            table = Table::default();
+                            row = None;
+                            cell = None;
+                        }
+                    }
+                    "tr" if tbl_depth == 1 && para.is_none() => row = Some(TableRow::default()),
+                    "tc" if tbl_depth == 1 && para.is_none() => {
+                        cell = Some(CellBuilder { span: 1, ..Default::default() })
+                    }
+                    "gridSpan" if tbl_depth == 1 && parent == "tcPr" => {
+                        if let (Some(c), Some(n)) =
+                            (cell.as_mut(), attr(attrs, "val").and_then(|v| v.trim().parse::<usize>().ok()))
+                        {
+                            c.span = n.clamp(1, 1000);
+                        }
+                    }
+                    "vMerge" if tbl_depth == 1 && parent == "tcPr" => {
+                        if let Some(c) = cell.as_mut() {
+                            c.vmerge_continue = attr(attrs, "val") != Some("restart");
+                        }
+                    }
+                    "hyperlink" => {
+                        let target = attr(attrs, "id").and_then(|id| rels.get(id)).cloned();
+                        let anchor = attr(attrs, "anchor").filter(|a| !a.is_empty());
+                        hyper = match (target, anchor) {
+                            (Some(t), Some(a)) => Some(format!("{t}#{a}")),
+                            (Some(t), None) => Some(t),
+                            (None, Some(a)) => Some(format!("#{a}")),
+                            (None, None) => None,
+                        };
+                    }
+                    "fldSimple" => {
+                        fields.push(Field {
+                            instr: String::new(),
+                            link: attr(attrs, "instr").and_then(field_link),
+                            in_result: true,
+                        });
+                    }
+                    "fldChar" if parent == "r" => match attr(attrs, "fldCharType") {
+                        Some("begin") => fields.push(Field::default()),
+                        Some("separate") => {
+                            if let Some(f) = fields.last_mut() {
+                                f.link = field_link(&f.instr);
+                                f.in_result = true;
+                            }
+                        }
+                        Some("end") => {
+                            fields.pop();
+                        }
+                        _ => {}
+                    },
+                    "instrText" if parent == "r" => in_instr = true,
                     "p" => para = Some(ParaBuilder::default()),
                     "r" if para.is_some() => run = Some(RunBuilder::default()),
                     "t" if parent == "r" => in_t = true,
@@ -784,27 +968,76 @@ fn parse_document(events: &[Ev], styles: &Styles, numbering: Option<&Numbering>)
                 stack.pop();
                 match name.as_str() {
                     "t" => in_t = false,
+                    "instrText" => in_instr = false,
+                    "hyperlink" => hyper = None,
+                    "fldSimple" => {
+                        fields.pop();
+                    }
                     "r" => {
                         if let (Some(r), Some(p)) = (run.take(), para.as_mut()) {
                             if !r.text.is_empty() {
-                                p.pending.push((r.text, r.rpr));
+                                let link = hyper.clone().or_else(|| {
+                                    fields.iter().rev().find(|f| f.in_result && f.link.is_some()).and_then(|f| f.link.clone())
+                                });
+                                p.pending.push((r.text, r.rpr, link));
                             }
                         }
                     }
                     "p" => {
                         run = None;
                         in_t = false;
+                        in_instr = false;
                         if let Some(p) = para.take() {
-                            out.push(finish_paragraph(p, styles, numbering));
+                            let p = finish_paragraph(p, styles, numbering);
+                            if tbl_depth == 0 {
+                                out.push(Block::Paragraph(p));
+                            } else if let Some(c) = cell.as_mut() {
+                                c.paragraphs.push(p);
+                            }
+                        }
+                    }
+                    "tc" if tbl_depth == 1 && para.is_none() => {
+                        if let (Some(c), Some(r)) = (cell.take(), row.as_mut()) {
+                            let mut paragraphs = c.paragraphs;
+                            if c.vmerge_continue || (paragraphs.len() == 1 && paragraphs[0] == Paragraph::default()) {
+                                paragraphs.clear();
+                            }
+                            r.cells.push(TableCell { paragraphs });
+                            for _ in 1..c.span {
+                                r.cells.push(TableCell::default());
+                            }
+                        }
+                    }
+                    "tr" if tbl_depth == 1 && para.is_none() => {
+                        if let Some(r) = row.take() {
+                            table.rows.push(r);
+                        }
+                    }
+                    "tbl" => {
+                        tbl_depth = tbl_depth.saturating_sub(1);
+                        if tbl_depth == 0 {
+                            let mut t = std::mem::take(&mut table);
+                            row = None;
+                            cell = None;
+                            if !t.rows.is_empty() {
+                                t.make_rectangular();
+                                out.push(Block::Table(t));
+                            }
                         }
                     }
                     _ => {}
                 }
             }
             Ev::Text(t) => {
-                if in_t && skip == 0 {
-                    if let Some(r) = run.as_mut() {
-                        r.text.push_str(t);
+                if skip == 0 {
+                    if in_t {
+                        if let Some(r) = run.as_mut() {
+                            r.text.push_str(t);
+                        }
+                    } else if in_instr {
+                        if let Some(f) = fields.last_mut() {
+                            f.instr.push_str(t);
+                        }
                     }
                 }
             }
@@ -841,6 +1074,31 @@ mod tests {
         zw.finish().unwrap().into_inner()
     }
 
+    fn ps(d: &Document) -> Vec<&Paragraph> {
+        d.paragraphs().collect()
+    }
+
+    fn table(d: &Document) -> &Table {
+        d.tables().next().expect("a table")
+    }
+
+    fn cell_texts(t: &Table) -> Vec<Vec<String>> {
+        t.rows.iter().map(|r| r.cells.iter().map(|c| c.plain_text()).collect()).collect()
+    }
+
+    fn docx_with_rels(body: &str, rels: &str) -> Vec<u8> {
+        let base = docx(body, None, None);
+        let mut zr = zip::ZipArchive::new(Cursor::new(base)).unwrap();
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..zr.len() {
+            let f = zr.by_index_raw(i).unwrap();
+            zw.raw_copy_file(f).unwrap();
+        }
+        zw.start_file("word/_rels/document.xml.rels", SimpleFileOptions::default()).unwrap();
+        zw.write_all(format!(r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#).as_bytes()).unwrap();
+        zw.finish().unwrap().into_inner()
+    }
+
     fn parse(body: &str) -> Document {
         read(&docx(body, None, None)).unwrap()
     }
@@ -850,9 +1108,9 @@ mod tests {
         let d = parse(r#"<w:p><w:r><w:t>Bonjour</w:t></w:r></w:p><w:p/>"#);
         assert_eq!(d.metadata.title.as_deref(), Some("Mon titre"));
         assert_eq!(d.metadata.author.as_deref(), Some("Alice"));
-        assert_eq!(d.paragraphs.len(), 2);
-        assert_eq!(d.paragraphs[0].plain_text(), "Bonjour");
-        assert!(d.paragraphs[1].runs.is_empty());
+        assert_eq!(ps(&d).len(), 2);
+        assert_eq!(ps(&d)[0].plain_text(), "Bonjour");
+        assert!(ps(&d)[1].runs.is_empty());
     }
 
     #[test]
@@ -862,7 +1120,7 @@ mod tests {
             <w:r><w:rPr><w:b/><w:u w:val="single"/></w:rPr><w:t>b</w:t></w:r>
             <w:r><w:rPr><w:b w:val="off"/><w:vertAlign w:val="superscript"/></w:rPr><w:t>c</w:t></w:r></w:p>"#,
         );
-        let p = &d.paragraphs[0];
+        let p = &ps(&d)[0];
         assert_eq!(p.runs.len(), 2);
         assert_eq!(p.runs[0].text, "ab");
         assert!(p.runs[0].style.bold && p.runs[0].style.underline && !p.runs[0].style.italic);
@@ -876,7 +1134,7 @@ mod tests {
             r#"<w:p><w:r><w:t xml:space="preserve"> a </w:t><w:tab/><w:t>b</w:t><w:br/><w:br w:type="page"/><w:t>c &amp; d</w:t><w:noBreakHyphen/></w:r>
             <w:r><w:delText>gone</w:delText></w:r><w:del><w:r><w:t>del</w:t></w:r></w:del></w:p>"#,
         );
-        assert_eq!(d.paragraphs[0].plain_text(), " a \tb\u{2028}c & d-");
+        assert_eq!(ps(&d)[0].plain_text(), " a \tb\u{2028}c & d-");
     }
 
     #[test]
@@ -894,15 +1152,15 @@ mod tests {
         <w:p><w:pPr><w:pStyle w:val="Heading7"/></w:pPr><w:r><w:t>X</w:t></w:r></w:p>
         <w:p><w:r><w:rPr><w:rStyle w:val="Strong"/><w:sz w:val="40"/><w:color w:val="auto"/></w:rPr><w:t>S</w:t></w:r></w:p>"#;
         let d = read(&docx(body, Some(styles), None)).unwrap();
-        let h = &d.paragraphs[0];
+        let h = &ps(&d)[0];
         assert_eq!(h.style, ParagraphStyle::Heading1);
         assert_eq!(h.alignment, Alignment::Left);
         // Everything comes from the heading style: no direct formatting.
         assert_eq!(h.runs[0].style, CharStyle::default());
-        assert_eq!(d.paragraphs[1].style, ParagraphStyle::Heading2);
-        assert_eq!(d.paragraphs[2].style, ParagraphStyle::Quote);
-        assert_eq!(d.paragraphs[3].style, ParagraphStyle::Heading3);
-        let s = &d.paragraphs[4].runs[0].style;
+        assert_eq!(ps(&d)[1].style, ParagraphStyle::Heading2);
+        assert_eq!(ps(&d)[2].style, ParagraphStyle::Quote);
+        assert_eq!(ps(&d)[3].style, ParagraphStyle::Heading3);
+        let s = &ps(&d)[4].runs[0].style;
         assert!(s.bold);
         assert_eq!(s.color, Some(Rgb(255, 0, 0)));
         assert_eq!(s.font_size, Some(20.0));
@@ -920,31 +1178,139 @@ mod tests {
         <w:p><w:pPr><w:pStyle w:val="LB"/></w:pPr><w:r><w:t>d</w:t></w:r></w:p>
         <w:p><w:pPr><w:numPr><w:numId w:val="0"/></w:numPr></w:pPr><w:r><w:t>e</w:t></w:r></w:p>"#;
         let d = read(&docx(body, Some(styles), Some(numbering))).unwrap();
-        let kinds: Vec<_> = d.paragraphs.iter().map(|p| p.list).collect();
+        let kinds: Vec<_> = d.paragraphs().map(|p| p.list).collect();
         assert_eq!(
             kinds,
             vec![Some(ListKind::Bullet), Some(ListKind::Numbered), Some(ListKind::Bullet), Some(ListKind::Bullet), None]
         );
-        assert!(!d.paragraphs[1].runs[0].style.bold);
+        assert!(!ps(&d)[1].runs[0].style.bold);
         // No numbering part: bullets.
         let d = parse(r#"<w:p><w:pPr><w:numPr><w:numId w:val="3"/></w:numPr></w:pPr><w:r><w:t>x</w:t></w:r></w:p>"#);
-        assert_eq!(d.paragraphs[0].list, Some(ListKind::Bullet));
+        assert_eq!(ps(&d)[0].list, Some(ListKind::Bullet));
     }
 
     #[test]
-    fn alignment_highlight_size_tables() {
+    fn alignment_highlight_size() {
         let body = r#"<w:p><w:pPr><w:jc w:val="both"/></w:pPr><w:r><w:rPr><w:highlight w:val="yellow"/><w:sz w:val="25"/></w:rPr><w:t>J</w:t></w:r></w:p>
         <w:tbl><w:tr><w:tc><w:p><w:pPr><w:jc w:val="end"/></w:pPr><w:hyperlink><w:r><w:rPr><w:shd w:fill="00FF00" w:val="clear"/></w:rPr><w:t>T</w:t></w:r></w:hyperlink></w:p></w:tc></w:tr></w:tbl>
         <w:p><w:r><w:drawing><w:p><w:r><w:t>no</w:t></w:r></w:p></w:drawing></w:r></w:p><w:sectPr/>"#;
         let d = parse(body);
-        assert_eq!(d.paragraphs.len(), 3);
-        assert_eq!(d.paragraphs[0].alignment, Alignment::Justify);
-        let s = &d.paragraphs[0].runs[0].style;
+        assert_eq!(ps(&d).len(), 2);
+        assert_eq!(ps(&d)[0].alignment, Alignment::Justify);
+        let s = &ps(&d)[0].runs[0].style;
         assert_eq!(s.highlight, Some(Rgb(255, 255, 0)));
         assert_eq!(s.font_size, Some(12.5));
-        assert_eq!(d.paragraphs[1].alignment, Alignment::Right);
-        assert_eq!(d.paragraphs[1].runs[0].style.highlight, Some(Rgb(0, 255, 0)));
-        assert!(d.paragraphs[2].runs.is_empty());
+        let c = &table(&d).rows[0].cells[0].paragraphs[0];
+        assert_eq!(c.alignment, Alignment::Right);
+        assert_eq!(c.runs[0].style.highlight, Some(Rgb(0, 255, 0)));
+        assert_eq!(c.runs[0].style.link, None);
+        assert!(ps(&d)[1].runs.is_empty());
+    }
+
+    fn cell(t: &str) -> String {
+        format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>")
+    }
+
+    #[test]
+    fn table_basic_and_rectangular() {
+        let body = format!(
+            "<w:p><w:r><w:t>avant</w:t></w:r></w:p><w:tbl><w:tblPr><w:tblW w:w=\"5000\"/></w:tblPr><w:tblGrid><w:gridCol w:w=\"1\"/></w:tblGrid>\
+             <w:tr><w:trPr/>{}{}</w:tr><w:tr>{}</w:tr></w:tbl><w:p><w:r><w:t>apres</w:t></w:r></w:p>",
+            cell("a"),
+            cell("b"),
+            cell("c")
+        );
+        let d = parse(&body);
+        assert_eq!(d.blocks.len(), 3);
+        assert_eq!(cell_texts(table(&d)), vec![vec!["a", "b"], vec!["c", ""]]);
+        assert!(table(&d).rows[1].cells[1].paragraphs.is_empty());
+    }
+
+    #[test]
+    fn table_grid_span_and_vmerge() {
+        let body = format!(
+            "<w:tbl><w:tr><w:tc><w:tcPr><w:gridSpan w:val=\"3\"/></w:tcPr><w:p><w:r><w:t>wide</w:t></w:r></w:p></w:tc></w:tr>\
+             <w:tr><w:tc><w:tcPr><w:vMerge w:val=\"restart\"/></w:tcPr><w:p><w:r><w:t>top</w:t></w:r></w:p></w:tc>{}{}</w:tr>\
+             <w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr><w:p><w:r><w:t>hidden</w:t></w:r></w:p></w:tc>{}{}</w:tr></w:tbl>",
+            cell("x"),
+            cell("y"),
+            cell("z"),
+            cell("w")
+        );
+        let d = parse(&body);
+        assert_eq!(
+            cell_texts(table(&d)),
+            vec![vec!["wide", "", ""], vec!["top", "x", "y"], vec!["", "z", "w"]]
+        );
+    }
+
+    #[test]
+    fn table_nested_is_flattened() {
+        let body = "<w:tbl><w:tr><w:tc><w:p><w:r><w:t>one</w:t></w:r></w:p>\
+            <w:tbl><w:tr><w:tc><w:p><w:r><w:t>in1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>in2</w:t></w:r></w:p></w:tc></w:tr></w:tbl>\
+            <w:p><w:r><w:t>two</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>next</w:t></w:r></w:p></w:tc></w:tr></w:tbl>";
+        let d = parse(body);
+        let t = table(&d);
+        assert_eq!(t.rows.len(), 1);
+        assert_eq!(t.rows[0].cells.len(), 2);
+        let texts: Vec<String> = t.rows[0].cells[0].paragraphs.iter().map(|p| p.plain_text()).collect();
+        assert_eq!(texts, vec!["one", "in1", "in2", "two"]);
+        assert_eq!(t.rows[0].cells[1].plain_text(), "next");
+        assert_eq!(d.blocks.len(), 1);
+    }
+
+    #[test]
+    fn hyperlink_via_relationship_and_anchor() {
+        let body = r#"<w:p><w:r><w:t>a </w:t></w:r><w:hyperlink r:id="rId9" xmlns:r="urn:r"><w:r><w:rPr><w:rStyle w:val="Hyperlink"/><w:b/></w:rPr><w:t>lien</w:t></w:r></w:hyperlink>
+            <w:hyperlink w:anchor="sec1"><w:r><w:t>interne</w:t></w:r></w:hyperlink><w:hyperlink r:id="nope"><w:r><w:t>x</w:t></w:r></w:hyperlink></w:p>"#;
+        let rels = r#"<Relationship Id="rId9" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://exemple.org/?a=1&amp;b=2" TargetMode="External"/>"#;
+        let styles = r#"<w:style w:type="character" w:styleId="Hyperlink"><w:name w:val="Hyperlink"/><w:rPr><w:color w:val="0563C1"/><w:u w:val="single"/></w:rPr></w:style>"#;
+        // Build with styles too.
+        let base = docx_with_rels(&body.replace("<w:p>", "<w:p xmlns:r=\"urn:r\">"), rels);
+        let mut zr = zip::ZipArchive::new(Cursor::new(base)).unwrap();
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for i in 0..zr.len() {
+            let f = zr.by_index_raw(i).unwrap();
+            zw.raw_copy_file(f).unwrap();
+        }
+        zw.start_file("word/styles.xml", SimpleFileOptions::default()).unwrap();
+        zw.write_all(format!(r#"<w:styles {W}>{styles}</w:styles>"#).as_bytes()).unwrap();
+        let d = read(&zw.finish().unwrap().into_inner()).unwrap();
+        let runs = &ps(&d)[0].runs;
+        assert_eq!(runs.len(), 4, "{runs:?}");
+        assert_eq!(runs[0].style.link, None);
+        assert_eq!(runs[1].text, "lien");
+        assert_eq!(runs[1].style.link.as_deref(), Some("https://exemple.org/?a=1&b=2"));
+        assert!(runs[1].style.bold);
+        assert!(!runs[1].style.underline);
+        assert_eq!(runs[1].style.color, None);
+        assert_eq!(runs[2].style.link.as_deref(), Some("#sec1"));
+        assert_eq!(runs[3].style.link, None);
+    }
+
+    #[test]
+    fn hyperlink_field_codes() {
+        let body = r#"<w:p>
+            <w:fldSimple w:instr=" HYPERLINK &quot;https://a.org/&quot; "><w:r><w:t>simple</w:t></w:r></w:fldSimple>
+            <w:r><w:t> mid </w:t></w:r>
+            <w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText xml:space="preserve"> HYPERLINK "https://b.org/" \o "tip" </w:instrText></w:r>
+            <w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>complexe</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>
+            <w:r><w:t> fin </w:t></w:r>
+            <w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGE </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>3</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>
+            <w:fldSimple w:instr="HYPERLINK \l &quot;ancre&quot;"><w:r><w:t>loc</w:t></w:r></w:fldSimple></w:p>"#;
+        let d = parse(body);
+        let runs = &ps(&d)[0].runs;
+        let got: Vec<(&str, Option<&str>)> = runs.iter().map(|r| (r.text.as_str(), r.style.link.as_deref())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("simple", Some("https://a.org/")),
+                (" mid ", None),
+                ("complexe", Some("https://b.org/")),
+                (" fin 3", None),
+                ("loc", Some("#ancre")),
+            ]
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@ pub struct Settings {
     pub font_family: String,
     pub font_size: f64,
     pub show_status_bar: bool,
+    /// Shows the advanced toolbar (tables, special characters, links...).
+    pub advanced_mode: bool,
     pub color_scheme: ColorScheme,
     pub window_width: i32,
     pub window_height: i32,
@@ -34,6 +36,7 @@ impl Default for Settings {
             font_family: "Cantarell".into(),
             font_size: 12.0,
             show_status_bar: true,
+            advanced_mode: false,
             color_scheme: ColorScheme::System,
             window_width: 1000,
             window_height: 760,
@@ -146,6 +149,7 @@ fn to_keyfile(settings: &Settings) -> KeyFile {
     kf.set_string(GROUP, "font-family", &settings.font_family);
     kf.set_double(GROUP, "font-size", settings.font_size);
     kf.set_boolean(GROUP, "show-status-bar", settings.show_status_bar);
+    kf.set_boolean(GROUP, "advanced-mode", settings.advanced_mode);
     kf.set_string(GROUP, "color-scheme", color_scheme_name(settings.color_scheme));
     kf.set_integer(GROUP, "window-width", settings.window_width);
     kf.set_integer(GROUP, "window-height", settings.window_height);
@@ -190,6 +194,7 @@ fn from_keyfile(kf: &KeyFile) -> Settings {
         font_family,
         font_size,
         show_status_bar: boolean("show-status-bar", defaults.show_status_bar),
+        advanced_mode: boolean("advanced-mode", defaults.advanced_mode),
         color_scheme,
         window_width,
         window_height,
@@ -218,6 +223,7 @@ mod tests {
             font_family: "Noto Serif, Italic".into(),
             font_size: 13.5,
             show_status_bar: false,
+            advanced_mode: true,
             color_scheme: ColorScheme::Dark,
             window_width: 1200,
             window_height: 900,

@@ -140,6 +140,18 @@ impl Application {
                         .developer_name("Gwords")
                         .version(env!("CARGO_PKG_VERSION"))
                         .license_type(gtk::License::Gpl30)
+                        .release_notes_version("0.1.1")
+                        .release_notes(
+                            "<p>Nouveau : le mode avancé, activable depuis le menu (Ctrl+Maj+A).</p>\
+                             <ul>\
+                             <li>Tableaux : insertion, lignes et colonnes, texte riche dans les cellules</li>\
+                             <li>Caractères spéciaux</li>\
+                             <li>Liens hypertexte</li>\
+                             <li>Changement de casse</li>\
+                             <li>Insertion de la date et de l’heure</li>\
+                             <li>Statistiques du document</li>\
+                             </ul>",
+                        )
                         .comments("Un traitement de texte simple et élégant pour GNOME.")
                         .build();
                     about.present(app.active_window().as_ref());
@@ -158,6 +170,9 @@ impl Application {
             ("win.save", &["<Control>s"]),
             ("win.save-as", &["<Control><Shift>s"]),
             ("win.close-tab", &["<Control>w"]),
+            ("win.advanced-mode", &["<Control><Shift>a"]),
+            ("win.insert-link", &["<Control>k"]),
+            ("win.special-chars", &["<Control><Shift>c"]),
             ("win.find", &["<Control>f"]),
             ("win.replace", &["<Control>h"]),
             ("win.bold", &["<Control>b"]),

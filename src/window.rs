@@ -14,6 +14,7 @@ use crate::document_page::DocumentPage;
 use crate::editor::Editor;
 use crate::formats::FileFormat;
 use crate::settings::{self, Settings};
+use crate::ui::advanced_bar::AdvancedBar;
 use crate::ui::format_bar::FormatBar;
 use crate::ui::search_bar::SearchBar;
 use crate::ui::status_bar::StatusBar;
@@ -29,6 +30,8 @@ mod imp {
         pub window_title: OnceCell<adw::WindowTitle>,
         pub toast_overlay: OnceCell<adw::ToastOverlay>,
         pub format_bar: OnceCell<FormatBar>,
+        pub advanced_bar: OnceCell<AdvancedBar>,
+        pub advanced_revealer: OnceCell<gtk::Revealer>,
         pub search_bar: OnceCell<SearchBar>,
         pub status_bar: OnceCell<StatusBar>,
         pub force_close: Cell<bool>,
@@ -235,6 +238,13 @@ impl Window {
         let window_title = adw::WindowTitle::new("Gwords", "");
         let format_bar = FormatBar::new();
         let search_bar = SearchBar::new();
+        let advanced_bar = AdvancedBar::new();
+        let advanced_revealer = gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideDown)
+            .transition_duration(250)
+            .reveal_child(s.advanced_mode)
+            .child(&advanced_bar)
+            .build();
         let status_bar = StatusBar::new();
         status_bar.set_visible(s.show_status_bar);
         let toast_overlay = adw::ToastOverlay::new();
@@ -256,6 +266,8 @@ impl Window {
         header.pack_start(&tab_btn);
 
         let menu = gio::Menu::new();
+        let s0 = gio::Menu::new();
+        s0.append(Some("Mode avancé"), Some("win.advanced-mode"));
         let s1 = gio::Menu::new();
         s1.append(Some("Nouvel onglet"), Some("win.new-tab"));
         s1.append(Some("Nouvelle fenêtre"), Some("app.new-window"));
@@ -265,10 +277,11 @@ impl Window {
         let s3 = gio::Menu::new();
         s3.append(Some("Rechercher"), Some("win.find"));
         s3.append(Some("Rechercher et remplacer"), Some("win.replace"));
+        s3.append(Some("Statistiques du document"), Some("win.statistics"));
         let s4 = gio::Menu::new();
         s4.append(Some("Préférences"), Some("app.preferences"));
         s4.append(Some("À propos de Gwords"), Some("app.about"));
-        for sec in [&s1, &s2, &s3, &s4] {
+        for sec in [&s0, &s1, &s2, &s3, &s4] {
             menu.append_section(None, sec);
         }
         let menu_btn = gtk::MenuButton::builder()
@@ -293,6 +306,7 @@ impl Window {
         top.append(&header);
         top.append(&tab_bar);
         top.append(&format_bar);
+        top.append(&advanced_revealer);
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&search_bar);
@@ -309,6 +323,8 @@ impl Window {
         let _ = imp.window_title.set(window_title);
         let _ = imp.toast_overlay.set(toast_overlay);
         let _ = imp.format_bar.set(format_bar);
+        let _ = imp.advanced_bar.set(advanced_bar);
+        let _ = imp.advanced_revealer.set(advanced_revealer);
         let _ = imp.search_bar.set(search_bar);
         let _ = imp.status_bar.set(status_bar);
 
@@ -379,6 +395,12 @@ impl Window {
     }
 
     fn apply_settings(&self, s: &Settings) {
+        if let Some(r) = self.imp().advanced_revealer.get() {
+            r.set_reveal_child(s.advanced_mode);
+        }
+        if let Some(a) = self.lookup_action("advanced-mode") {
+            a.change_state(&s.advanced_mode.to_variant());
+        }
         if let Some(sb) = self.imp().status_bar.get() {
             sb.set_visible(s.show_status_bar);
         }
@@ -412,7 +434,42 @@ impl Window {
                 w.with_editor(|e| e.set_paragraph_style(style));
             })
             .build();
+        let advanced = gio::SimpleAction::new_stateful(
+            "advanced-mode",
+            None,
+            &settings::get().advanced_mode.to_variant(),
+        );
+        advanced.connect_change_state(clone!(
+            #[weak(rename_to = win)]
+            self,
+            move |action, value| {
+                let Some(on) = value.and_then(|v| v.get::<bool>()) else { return };
+                if action.state().and_then(|v| v.get::<bool>()) == Some(on) {
+                    return;
+                }
+                action.set_state(&on.to_variant());
+                let mut s = settings::get();
+                if s.advanced_mode != on {
+                    s.advanced_mode = on;
+                    settings::set(s);
+                    if on {
+                        win.toast("Mode avancé activé : tableaux, caractères spéciaux et plus");
+                    }
+                }
+                if let Some(r) = win.imp().advanced_revealer.get() {
+                    r.set_reveal_child(on);
+                }
+            }
+        ));
+        self.add_action(&advanced);
         self.add_action_entries([
+            simple("insert-link", |w| w.with_advanced(|b| b.popup_link_editor())),
+            simple("special-chars", |w| w.with_advanced(|b| b.popup_special_chars())),
+            simple("statistics", |w| {
+                if let Some(b) = w.imp().advanced_bar.get() {
+                    b.show_statistics();
+                }
+            }),
             simple("new-tab", |w| {
                 w.new_tab();
             }),
@@ -459,6 +516,24 @@ impl Window {
         ]);
     }
 
+    /// Runs `f` on the advanced bar, enabling advanced mode first if needed.
+    fn with_advanced(&self, f: impl Fn(&AdvancedBar) + 'static) {
+        if !settings::get().advanced_mode
+            && let Some(a) = self.lookup_action("advanced-mode")
+        {
+            a.change_state(&true.to_variant());
+        }
+        glib::idle_add_local_once(clone!(
+            #[weak(rename_to = win)]
+            self,
+            move || {
+                if let Some(b) = win.imp().advanced_bar.get() {
+                    f(b);
+                }
+            }
+        ));
+    }
+
     // -------------------------------------------------------------- tabs
 
     fn new_tab(&self) -> (DocumentPage, adw::TabPage) {
@@ -503,6 +578,9 @@ impl Window {
         let imp = self.imp();
         let editor = self.active_page().map(|p| p.editor());
         if let Some(b) = imp.format_bar.get() {
+            b.set_editor(editor.as_ref());
+        }
+        if let Some(b) = imp.advanced_bar.get() {
             b.set_editor(editor.as_ref());
         }
         if let Some(b) = imp.search_bar.get() {

@@ -4,15 +4,76 @@
 //! (`crate::formats`) and the editor (`crate::editor::convert`).
 //!
 //! Conventions:
-//! - A document is a flat list of paragraphs.
+//! - A document is a flat list of blocks: paragraphs and tables.
+//! - A table is a rectangular grid (every row has the same number of cells,
+//!   at least 1x1). A cell contains paragraphs only (nested tables are
+//!   flattened by readers); an empty cell has an empty `paragraphs` vector or
+//!   a single empty paragraph (both are equivalent; see `Document::normalized`).
 //! - Inside a run, `'\t'` is a tab and `'\u{2028}'` (LINE SEPARATOR) is a soft
 //!   line break (ODT `<text:line-break/>`, DOCX `<w:br/>`). Runs never contain `'\n'`.
 //! - An empty paragraph has an empty `runs` vector (or runs with empty text).
+//! - Hyperlinks are a character attribute (`CharStyle::link`): consecutive runs
+//!   with the same link form one hyperlink.
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Document {
     pub metadata: Metadata,
+    pub blocks: Vec<Block>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Block {
+    Paragraph(Paragraph),
+    Table(Table),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Table {
+    pub rows: Vec<TableRow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableRow {
+    pub cells: Vec<TableCell>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableCell {
     pub paragraphs: Vec<Paragraph>,
+}
+
+impl Table {
+    /// Empty table of `rows` x `cols` (each at least 1).
+    pub fn new(rows: usize, cols: usize) -> Table {
+        let row = TableRow { cells: vec![TableCell::default(); cols.max(1)] };
+        Table { rows: vec![row; rows.max(1)] }
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn column_count(&self) -> usize {
+        self.rows.iter().map(|r| r.cells.len()).max().unwrap_or(0)
+    }
+
+    /// Pads short rows with empty cells so the grid is rectangular, and
+    /// guarantees at least one row and one column.
+    pub fn make_rectangular(&mut self) {
+        if self.rows.is_empty() {
+            self.rows.push(TableRow::default());
+        }
+        let cols = self.column_count().max(1);
+        for row in &mut self.rows {
+            row.cells.resize(cols, TableCell::default());
+        }
+    }
+}
+
+impl TableCell {
+    pub fn plain_text(&self) -> String {
+        self.paragraphs.iter().map(Paragraph::plain_text).collect::<Vec<_>>().join("\n")
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -106,6 +167,8 @@ pub struct CharStyle {
     pub font_size: Option<f64>,
     pub color: Option<Rgb>,
     pub highlight: Option<Rgb>,
+    /// Hyperlink target (URL), if this text is part of a link.
+    pub link: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -142,21 +205,109 @@ impl Paragraph {
     }
 }
 
+impl Block {
+    pub fn as_paragraph(&self) -> Option<&Paragraph> {
+        match self {
+            Block::Paragraph(p) => Some(p),
+            Block::Table(_) => None,
+        }
+    }
+
+    pub fn as_table(&self) -> Option<&Table> {
+        match self {
+            Block::Table(t) => Some(t),
+            Block::Paragraph(_) => None,
+        }
+    }
+}
+
+impl From<Paragraph> for Block {
+    fn from(p: Paragraph) -> Block {
+        Block::Paragraph(p)
+    }
+}
+
+impl From<Table> for Block {
+    fn from(t: Table) -> Block {
+        Block::Table(t)
+    }
+}
+
 impl Document {
     /// Builds a document of plain paragraphs, one per line.
     pub fn from_plain_text(text: &str) -> Document {
-        let paragraphs = text
+        let blocks = text
             .split('\n')
-            .map(|line| Paragraph {
-                runs: if line.is_empty() { vec![] } else { vec![Run::plain(line.trim_end_matches('\r'))] },
-                ..Default::default()
+            .map(|line| {
+                let line = line.trim_end_matches('\r');
+                Block::Paragraph(Paragraph {
+                    runs: if line.is_empty() { vec![] } else { vec![Run::plain(line)] },
+                    ..Default::default()
+                })
             })
             .collect();
-        Document { metadata: Metadata::default(), paragraphs }
+        Document { metadata: Metadata::default(), blocks }
     }
 
+    /// Top-level paragraphs only (tables skipped).
+    pub fn paragraphs(&self) -> impl Iterator<Item = &Paragraph> {
+        self.blocks.iter().filter_map(Block::as_paragraph)
+    }
+
+    pub fn tables(&self) -> impl Iterator<Item = &Table> {
+        self.blocks.iter().filter_map(Block::as_table)
+    }
+
+    /// Plain text; table cells are separated by tabs and rows by newlines.
     pub fn plain_text(&self) -> String {
-        self.paragraphs.iter().map(Paragraph::plain_text).collect::<Vec<_>>().join("\n")
+        self.blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph(p) => p.plain_text(),
+                Block::Table(t) => t
+                    .rows
+                    .iter()
+                    .map(|r| r.cells.iter().map(|c| c.plain_text().replace('\n', " ")).collect::<Vec<_>>().join("\t"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Canonical form used to compare documents: adjacent runs with equal
+    /// style merged, empty runs dropped, tables made rectangular, and empty
+    /// cells represented by an empty `paragraphs` vector.
+    pub fn normalized(&self) -> Document {
+        fn norm_para(p: &Paragraph) -> Paragraph {
+            let mut runs: Vec<Run> = Vec::new();
+            for r in p.runs.iter().filter(|r| !r.text.is_empty()) {
+                match runs.last_mut() {
+                    Some(last) if last.style == r.style => last.text.push_str(&r.text),
+                    _ => runs.push(r.clone()),
+                }
+            }
+            Paragraph { runs, ..p.clone() }
+        }
+        let blocks = self
+            .blocks
+            .iter()
+            .map(|b| match b {
+                Block::Paragraph(p) => Block::Paragraph(norm_para(p)),
+                Block::Table(t) => {
+                    let mut t = t.clone();
+                    t.make_rectangular();
+                    for cell in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+                        cell.paragraphs = cell.paragraphs.iter().map(norm_para).collect();
+                        if cell.paragraphs.len() == 1 && cell.paragraphs[0] == Paragraph::default() {
+                            cell.paragraphs.clear();
+                        }
+                    }
+                    Block::Table(t)
+                }
+            })
+            .collect();
+        Document { metadata: self.metadata.clone(), blocks }
     }
 }
 
@@ -170,5 +321,21 @@ mod tests {
         assert_eq!(c.to_hex(), "12abff");
         assert_eq!(Rgb::from_hex("#12ABFF"), Some(c));
         assert_eq!(Rgb::from_hex("xyz"), None);
+    }
+
+    #[test]
+    fn tables_and_normalization() {
+        let mut t = Table::new(2, 3);
+        assert_eq!((t.row_count(), t.column_count()), (2, 3));
+        t.rows[1].cells.truncate(1);
+        t.rows[0].cells[0].paragraphs.push(Paragraph { runs: vec![Run::plain("a"), Run::plain("b")], ..Default::default() });
+        t.rows[0].cells[1].paragraphs.push(Paragraph::default());
+        let doc = Document { metadata: Metadata::default(), blocks: vec![Block::Table(t)] };
+        let n = doc.normalized();
+        let t = n.tables().next().unwrap();
+        assert_eq!(t.rows[1].cells.len(), 3);
+        assert_eq!(t.rows[0].cells[0].paragraphs[0].runs, vec![Run::plain("ab")]);
+        assert!(t.rows[0].cells[1].paragraphs.is_empty());
+        assert_eq!(doc.plain_text(), "ab\t\t\n");
     }
 }

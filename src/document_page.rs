@@ -138,8 +138,16 @@ mod imp {
             click.connect_released(glib::clone!(
                 #[weak]
                 obj,
-                move |_, _, _, _| {
+                move |gesture, _, x, y| {
                     let editor = obj.editor();
+                    // Only clicks on the backdrop (around/below the page) move
+                    // the cursor to the end: clicks inside the page or a table
+                    // cell belong to the editors themselves.
+                    if let Some(target) = gesture.widget().and_then(|w| w.pick(x, y, gtk::PickFlags::DEFAULT)) {
+                        if target == *editor.upcast_ref::<gtk::Widget>() || target.is_ancestor(&editor) {
+                            return;
+                        }
+                    }
                     let buffer = editor.buffer();
                     buffer.place_cursor(&buffer.end_iter());
                     editor.grab_focus();

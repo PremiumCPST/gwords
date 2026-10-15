@@ -150,3 +150,125 @@ textview.page.custom-caret text {
 tabbar tab {
     transition: background-color 200ms ease-out;
 }
+
+/* ---------- Tableaux (0.1.1) ---------- */
+
+/* Bordures : la grille ne dessine que le haut et la gauche, chaque cellule
+ * dessine sa droite et son bas. Les bordures ne se doublent pas sur le
+ * pourtour, et les coins ne sont jamais dessinés deux fois. */
+.gw-table {
+    margin: 8px 0;
+}
+
+.gw-table-grid {
+    border-top: 1px solid alpha(#000000, 0.18);
+    border-left: 1px solid alpha(#000000, 0.18);
+    border-radius: 6px;
+}
+
+textview.table-cell {
+    background-color: transparent;
+    padding: 0;
+    border-right: 1px solid alpha(#000000, 0.18);
+    border-bottom: 1px solid alpha(#000000, 0.18);
+    transition: background-color 150ms ease-out;
+}
+
+textview.table-cell text {
+    background-color: transparent;
+}
+
+/* En-tête : légère teinte, indication visuelle seulement. */
+textview.table-cell.first-row {
+    background-color: alpha(currentColor, 0.04);
+}
+
+/* Cellule active : après .first-row pour l'emporter à spécificité égale. */
+textview.table-cell:focus-within {
+    background-color: alpha(var(--accent-bg-color), 0.06);
+}
+
+/* Le curseur animé est dessiné par l'application. */
+textview.table-cell.custom-caret,
+textview.table-cell.custom-caret text {
+    caret-color: transparent;
+    -gtk-secondary-caret-color: transparent;
+}
+
+@media (prefers-color-scheme: dark) {
+    .gw-table-grid {
+        border-top-color: alpha(#ffffff, 0.18);
+        border-left-color: alpha(#ffffff, 0.18);
+    }
+
+    textview.table-cell {
+        border-right-color: alpha(#ffffff, 0.18);
+        border-bottom-color: alpha(#ffffff, 0.18);
+    }
+}
+
+/* ---------- Barre avancée (0.1.1) ---------- */
+
+/* Second row of the same toolbar: no separator, tight spacing with the
+   format bar above it. */
+.advanced-bar {
+    padding: 0 8px 4px;
+}
+
+.advanced-bar button {
+    transition: background-color 150ms ease-out,
+                transform 120ms ease-out;
+}
+
+.advanced-bar button:active {
+    transform: scale(0.94);
+}
+
+.advanced-bar menubutton.has-link > button {
+    background-color: alpha(var(--accent-bg-color), 0.18);
+    color: var(--accent-color);
+}
+
+/* ---------- Sélecteur de taille de tableau (0.1.1) ---------- */
+
+.table-picker-cell {
+    min-width: 18px;
+    min-height: 18px;
+    border: 1px solid alpha(currentColor, 0.25);
+    border-radius: 3px;
+    margin: 1px;
+    transition: background-color 120ms ease-out,
+                border-color 120ms ease-out;
+}
+
+.table-picker-cell.selected {
+    background-color: alpha(var(--accent-bg-color), 0.55);
+    border-color: var(--accent-bg-color);
+}
+
+/* ---------- Caractères spéciaux (0.1.1) ---------- */
+
+.special-chars button.special-char {
+    font-size: 1.35em;
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+    border-radius: 6px;
+    transition: background-color 120ms ease-out,
+                transform 100ms ease-out;
+}
+
+.special-chars button.special-char:hover {
+    background-color: alpha(currentColor, 0.08);
+}
+
+.special-chars button.special-char:active {
+    transform: scale(0.92);
+}
+
+/* ---------- Statistiques (0.1.1) ---------- */
+
+.stats-number {
+    font-feature-settings: "tnum";
+    font-weight: 600;
+}

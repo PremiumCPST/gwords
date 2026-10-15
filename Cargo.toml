@@ -1,6 +1,6 @@
 [package]
 name = "gwords"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Traitement de texte pour GNOME (ODT, DOCX) écrit en Rust avec GTK 4 et libadwaita"
 license = "GPL-3.0-or-later"

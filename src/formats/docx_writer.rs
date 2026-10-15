@@ -6,18 +6,24 @@ use std::io::Write as _;
 use zip::write::SimpleFileOptions;
 
 use crate::document::{
-    Alignment, CharStyle, Document, ListKind, Paragraph, ParagraphStyle, Run, VerticalAlign,
+    Alignment, Block, CharStyle, Document, ListKind, Paragraph, ParagraphStyle, Run, Table,
+    VerticalAlign,
 };
 use crate::formats::FormatError;
 
 const NS_W: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const NS_R: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+/// Usable text width of an A4 page with 2 cm margins, in twips.
+const TEXT_WIDTH: u32 = 9638;
+/// Relationship ids 1..=4 are taken by the fixed parts.
+const FIRST_LINK_RID: usize = 5;
 const XML_DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
 const BULLET_NUM: u32 = 1;
 const FIRST_NUMBERED_NUM: u32 = 2;
 
 /// Serializes the document as a .docx archive.
 pub fn write(doc: &Document) -> Result<Vec<u8>, FormatError> {
-    let (document_xml, numbered_groups) = document_xml(doc);
+    let (document_xml, numbered_groups, links) = document_xml(doc);
     let now = iso_now();
 
     let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
@@ -26,7 +32,7 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, FormatError> {
         ("[Content_Types].xml", content_types_xml()),
         ("_rels/.rels", root_rels_xml()),
         ("word/document.xml", document_xml),
-        ("word/_rels/document.xml.rels", document_rels_xml()),
+        ("word/_rels/document.xml.rels", document_rels_xml(&links)),
         ("word/styles.xml", styles_xml()),
         ("word/numbering.xml", numbering_xml(numbered_groups)),
         ("word/settings.xml", settings_xml()),
@@ -123,15 +129,24 @@ fn root_rels_xml() -> String {
     )
 }
 
-fn document_rels_xml() -> String {
-    let base = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+fn document_rels_xml(links: &[String]) -> String {
+    let base = NS_R;
+    let mut extra = String::new();
+    for (i, url) in links.iter().enumerate() {
+        let _ = write!(
+            extra,
+            "<Relationship Id=\"rId{}\" Type=\"{base}/hyperlink\" Target=\"{}\" TargetMode=\"External\"/>",
+            FIRST_LINK_RID + i,
+            escape(url)
+        );
+    }
     format!(
         "{XML_DECL}<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
 <Relationship Id=\"rId1\" Type=\"{base}/styles\" Target=\"styles.xml\"/>\
 <Relationship Id=\"rId2\" Type=\"{base}/numbering\" Target=\"numbering.xml\"/>\
 <Relationship Id=\"rId3\" Type=\"{base}/settings\" Target=\"settings.xml\"/>\
 <Relationship Id=\"rId4\" Type=\"{base}/fontTable\" Target=\"fontTable.xml\"/>\
-</Relationships>"
+{extra}</Relationships>"
     )
 }
 
@@ -203,14 +218,21 @@ fn styles_xml() -> String {
     s.push_str(&heading("Heading2", "heading 2", 32, 1));
     s.push_str(&heading("Heading3", "heading 3", 28, 2));
     s.push_str(
-        "<w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
+        &"<w:style w:type=\"paragraph\" w:styleId=\"Quote\"><w:name w:val=\"Quote\"/><w:basedOn w:val=\"Normal\"/><w:next w:val=\"Normal\"/><w:qFormat/>\
 <w:pPr><w:ind w:left=\"720\" w:right=\"720\"/></w:pPr><w:rPr><w:i/><w:iCs/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:customStyle=\"1\" w:styleId=\"Code\"><w:name w:val=\"Code\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/>\
 <w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr>\
 <w:rPr><w:rFonts w:ascii=\"Liberation Mono\" w:hAnsi=\"Liberation Mono\" w:eastAsia=\"Liberation Mono\" w:cs=\"Liberation Mono\"/><w:sz w:val=\"22\"/><w:szCs w:val=\"22\"/></w:rPr></w:style>\
 <w:style w:type=\"paragraph\" w:styleId=\"ListParagraph\"><w:name w:val=\"List Paragraph\"/><w:basedOn w:val=\"Normal\"/><w:qFormat/>\
 <w:pPr><w:ind w:left=\"720\"/><w:contextualSpacing/></w:pPr></w:style>\
-</w:styles>",
+<w:style w:type=\"character\" w:styleId=\"Hyperlink\"><w:name w:val=\"Hyperlink\"/><w:basedOn w:val=\"DefaultParagraphFont\"/><w:uiPriority w:val=\"99\"/><w:unhideWhenUsed/>\
+<w:rPr><w:color w:val=\"0563C1\"/><w:u w:val=\"single\"/></w:rPr></w:style>\
+<w:style w:type=\"table\" w:default=\"1\" w:styleId=\"TableNormal\"><w:name w:val=\"Normal Table\"/><w:uiPriority w:val=\"99\"/><w:semiHidden/><w:unhideWhenUsed/>\
+<w:tblPr><w:tblInd w:w=\"0\" w:type=\"dxa\"/><w:tblCellMar><w:top w:w=\"0\" w:type=\"dxa\"/><w:left w:w=\"108\" w:type=\"dxa\"/><w:bottom w:w=\"0\" w:type=\"dxa\"/><w:right w:w=\"108\" w:type=\"dxa\"/></w:tblCellMar></w:tblPr></w:style>\
+<w:style w:type=\"table\" w:styleId=\"TableGrid\"><w:name w:val=\"Table Grid\"/><w:basedOn w:val=\"TableNormal\"/><w:uiPriority w:val=\"39\"/>\
+<w:pPr><w:spacing w:after=\"0\" w:line=\"240\" w:lineRule=\"auto\"/></w:pPr><w:tblPr><w:tblBorders>{TABLE_BORDERS}</w:tblBorders></w:tblPr></w:style>\
+</w:styles>"
+            .replace("{TABLE_BORDERS}", &table_borders()),
     );
     s
 }
@@ -257,38 +279,118 @@ fn style_id(style: ParagraphStyle) -> Option<&'static str> {
     }
 }
 
-/// Returns the document.xml content and the number of numbered-list groups.
-fn document_xml(doc: &Document) -> (String, u32) {
+fn border_xml(sides: &[&str]) -> String {
+    sides
+        .iter()
+        .map(|n| format!("<w:{n} w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>"))
+        .collect()
+}
+
+fn table_borders() -> String {
+    border_xml(&["top", "left", "bottom", "right", "insideH", "insideV"])
+}
+
+/// Mutable state shared while writing the body.
+#[derive(Default)]
+struct Ctx {
+    /// Number of numbered-list groups so far.
+    groups: u32,
+    /// Hyperlink targets (without '#' anchors), in relationship order.
+    links: Vec<String>,
+}
+
+impl Ctx {
+    fn link_rid(&mut self, url: &str) -> String {
+        let i = match self.links.iter().position(|u| u == url) {
+            Some(i) => i,
+            None => {
+                self.links.push(url.to_string());
+                self.links.len() - 1
+            }
+        };
+        format!("rId{}", FIRST_LINK_RID + i)
+    }
+}
+
+/// Returns the document.xml content, the number of numbered-list groups and the hyperlink targets.
+fn document_xml(doc: &Document) -> (String, u32, Vec<String>) {
     let mut s = String::new();
     s.push_str(XML_DECL);
-    let _ = write!(s, "<w:document xmlns:w=\"{NS_W}\"><w:body>");
-    let mut groups = 0u32;
+    let _ = write!(s, "<w:document xmlns:w=\"{NS_W}\" xmlns:r=\"{NS_R}\"><w:body>");
+    let mut ctx = Ctx::default();
     let mut in_numbered = false;
-    for p in &doc.paragraphs {
-        if p.list == Some(ListKind::Numbered) {
-            if !in_numbered {
-                groups += 1;
+    for b in &doc.blocks {
+        match b {
+            Block::Paragraph(p) => write_listed_paragraph(&mut s, &mut ctx, &mut in_numbered, p),
+            Block::Table(t) => {
+                in_numbered = false;
+                write_table(&mut s, &mut ctx, t);
             }
-            in_numbered = true;
-        } else {
-            in_numbered = false;
         }
-        let num_id = match p.list {
-            None => None,
-            Some(ListKind::Bullet) => Some(BULLET_NUM),
-            Some(ListKind::Numbered) => Some(FIRST_NUMBERED_NUM + groups - 1),
-        };
-        write_paragraph(&mut s, p, num_id);
     }
     s.push_str(
         "<w:sectPr><w:pgSz w:w=\"11906\" w:h=\"16838\"/>\
 <w:pgMar w:top=\"1134\" w:right=\"1134\" w:bottom=\"1134\" w:left=\"1134\" w:header=\"709\" w:footer=\"709\" w:gutter=\"0\"/>\
 </w:sectPr></w:body></w:document>",
     );
-    (s, groups)
+    (s, ctx.groups, ctx.links)
 }
 
-fn write_paragraph(s: &mut String, p: &Paragraph, num_id: Option<u32>) {
+fn write_listed_paragraph(s: &mut String, ctx: &mut Ctx, in_numbered: &mut bool, p: &Paragraph) {
+    if p.list == Some(ListKind::Numbered) {
+        if !*in_numbered {
+            ctx.groups += 1;
+        }
+        *in_numbered = true;
+    } else {
+        *in_numbered = false;
+    }
+    let num_id = match p.list {
+        None => None,
+        Some(ListKind::Bullet) => Some(BULLET_NUM),
+        Some(ListKind::Numbered) => Some(FIRST_NUMBERED_NUM + ctx.groups - 1),
+    };
+    write_paragraph(s, ctx, p, num_id);
+}
+
+fn write_table(s: &mut String, ctx: &mut Ctx, table: &Table) {
+    let mut t = table.clone();
+    t.make_rectangular();
+    let cols = t.column_count();
+    if t.rows.is_empty() || cols == 0 {
+        return;
+    }
+    let cols32 = cols as u32;
+    let _ = write!(
+        s,
+        "<w:tbl><w:tblPr><w:tblStyle w:val=\"TableGrid\"/><w:tblW w:w=\"5000\" w:type=\"pct\"/>\
+<w:tblBorders>{}</w:tblBorders>\
+<w:tblLook w:val=\"04A0\" w:firstRow=\"1\" w:lastRow=\"0\" w:firstColumn=\"1\" w:lastColumn=\"0\" w:noHBand=\"0\" w:noVBand=\"1\"/></w:tblPr><w:tblGrid>",
+        table_borders()
+    );
+    for _ in 0..cols {
+        let _ = write!(s, "<w:gridCol w:w=\"{}\"/>", TEXT_WIDTH / cols32);
+    }
+    s.push_str("</w:tblGrid>");
+    for row in &t.rows {
+        s.push_str("<w:tr>");
+        for cell in &row.cells {
+            let _ = write!(s, "<w:tc><w:tcPr><w:tcW w:w=\"{}\" w:type=\"pct\"/></w:tcPr>", 5000 / cols32);
+            let mut in_numbered = false;
+            for p in &cell.paragraphs {
+                write_listed_paragraph(s, ctx, &mut in_numbered, p);
+            }
+            if cell.paragraphs.is_empty() {
+                s.push_str("<w:p/>");
+            }
+            s.push_str("</w:tc>");
+        }
+        s.push_str("</w:tr>");
+    }
+    s.push_str("</w:tbl>");
+}
+
+fn write_paragraph(s: &mut String, ctx: &mut Ctx, p: &Paragraph, num_id: Option<u32>) {
     s.push_str("<w:p>");
     let sid = style_id(p.style).or(if num_id.is_some() { Some("ListParagraph") } else { None });
     let jc = match p.alignment {
@@ -310,14 +412,41 @@ fn write_paragraph(s: &mut String, p: &Paragraph, num_id: Option<u32>) {
         }
         s.push_str("</w:pPr>");
     }
-    for r in &p.runs {
-        write_run(s, r);
+    let runs: Vec<&Run> = p.runs.iter().filter(|r| !r.text.is_empty()).collect();
+    let mut i = 0;
+    while i < runs.len() {
+        let link = runs[i].style.link.as_deref();
+        let mut j = i + 1;
+        while link.is_some() && j < runs.len() && runs[j].style.link.as_deref() == link {
+            j += 1;
+        }
+        if let Some(url) = link {
+            match url.strip_prefix('#').filter(|a| !a.is_empty()) {
+                Some(anchor) => {
+                    let _ = write!(s, "<w:hyperlink w:anchor=\"{}\" w:history=\"1\">", escape(anchor));
+                }
+                None => {
+                    let rid = ctx.link_rid(url);
+                    let _ = write!(s, "<w:hyperlink r:id=\"{rid}\" w:history=\"1\">");
+                }
+            }
+        }
+        for r in &runs[i..j] {
+            write_run(s, r);
+        }
+        if link.is_some() {
+            s.push_str("</w:hyperlink>");
+        }
+        i = j;
     }
     s.push_str("</w:p>");
 }
 
 fn rpr_xml(st: &CharStyle) -> String {
     let mut s = String::new();
+    if st.link.is_some() {
+        s.push_str("<w:rStyle w:val=\"Hyperlink\"/>");
+    }
     if let Some(f) = st.font_family.as_deref().filter(|f| !f.trim().is_empty()) {
         let f = escape(f);
         let _ = write!(
@@ -400,7 +529,7 @@ fn write_run(s: &mut String, run: &Run) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{Metadata, Rgb};
+    use crate::document::{Metadata, Rgb, TableCell, TableRow};
     use std::io::Read;
 
     fn read_part(bytes: &[u8], name: &str) -> String {
@@ -429,7 +558,7 @@ mod tests {
     fn parts_present_and_well_formed() {
         let doc = Document {
             metadata: Metadata { title: Some("A & B <t>".into()), author: Some("Moi".into()) },
-            paragraphs: vec![para(ParagraphStyle::Heading1, None, "Salut")],
+            blocks: vec![para(ParagraphStyle::Heading1, None, "Salut").into()],
         };
         let bytes = write(&doc).unwrap();
         for name in [
@@ -463,13 +592,15 @@ mod tests {
             font_size: Some(10.5),
             color: Some(Rgb(255, 0, 0)),
             highlight: Some(Rgb(1, 2, 3)),
+            link: None,
         };
         let doc = Document {
-            paragraphs: vec![Paragraph {
+            blocks: vec![Paragraph {
                 alignment: Alignment::Justify,
                 runs: vec![Run { text: "a<b&c\u{1}\td\u{2028}e".into(), style }],
                 ..Default::default()
-            }],
+            }
+            .into()],
             ..Default::default()
         };
         let bytes = write(&doc).unwrap();
@@ -495,13 +626,13 @@ mod tests {
     fn numbering_restart_groups() {
         let n = |t| para(ParagraphStyle::Normal, Some(ListKind::Numbered), t);
         let doc = Document {
-            paragraphs: vec![
-                n("a"),
-                n("b"),
-                para(ParagraphStyle::Normal, Some(ListKind::Bullet), "x"),
-                n("c"),
-                para(ParagraphStyle::Normal, None, "gap"),
-                n("d"),
+            blocks: vec![
+                n("a").into(),
+                n("b").into(),
+                para(ParagraphStyle::Normal, Some(ListKind::Bullet), "x").into(),
+                n("c").into(),
+                para(ParagraphStyle::Normal, None, "gap").into(),
+                n("d").into(),
             ],
             ..Default::default()
         };
@@ -515,5 +646,84 @@ mod tests {
         well_formed(&num);
         assert!(num.contains("w:numId=\"3\"") && num.contains("w:numId=\"4\""));
         assert_eq!(num.matches("<w:startOverride").count(), 2);
+    }
+
+    fn run(text: &str, style: CharStyle) -> Run {
+        Run { text: text.into(), style }
+    }
+
+    fn linked(url: &str) -> CharStyle {
+        CharStyle { link: Some(url.into()), ..Default::default() }
+    }
+
+    fn cell_of(paragraphs: Vec<Paragraph>) -> TableCell {
+        TableCell { paragraphs }
+    }
+
+    fn sample_doc() -> Document {
+        let bold = CharStyle { bold: true, ..Default::default() };
+        let bold_link = CharStyle { bold: true, link: Some("https://a.org/x?y=1&z=2".into()), ..Default::default() };
+        let rich = Paragraph {
+            runs: vec![
+                run("gras ", bold.clone()),
+                run("lien", bold_link),
+                run("lien2", linked("https://a.org/x?y=1&z=2")),
+                run(" fin", CharStyle::default()),
+                run("autre", linked("https://b.org")),
+                run("interne", linked("#sec")),
+            ],
+            ..Default::default()
+        };
+        let table = Table {
+            rows: vec![
+                TableRow {
+                    cells: vec![
+                        cell_of(vec![rich.clone(), para(ParagraphStyle::Normal, Some(ListKind::Numbered), "un")]),
+                        cell_of(vec![]),
+                        cell_of(vec![para(ParagraphStyle::Heading2, Some(ListKind::Bullet), "puce")]),
+                    ],
+                },
+                TableRow {
+                    cells: vec![
+                        cell_of(vec![Paragraph { alignment: Alignment::Center, runs: vec![run("c", bold)], ..Default::default() }]),
+                        cell_of(vec![para(ParagraphStyle::Normal, Some(ListKind::Numbered), "deux")]),
+                        cell_of(vec![]),
+                    ],
+                },
+            ],
+        };
+        Document {
+            metadata: Metadata::default(),
+            blocks: vec![rich.into(), table.clone().into(), para(ParagraphStyle::Normal, None, "entre").into(), table.into(), para(ParagraphStyle::Normal, None, "fin").into()],
+        }
+    }
+
+    #[test]
+    fn tables_and_links_well_formed() {
+        let bytes = write(&sample_doc()).unwrap();
+        for name in ["word/document.xml", "word/styles.xml", "word/_rels/document.xml.rels", "word/numbering.xml"] {
+            well_formed(&read_part(&bytes, name));
+        }
+        let x = read_part(&bytes, "word/document.xml");
+        assert!(x.contains("<w:tblStyle w:val=\"TableGrid\"/>") && x.contains("w:type=\"pct\""));
+        assert!(x.contains("<w:insideH") && x.contains("<w:insideV"));
+        assert!(x.contains("<w:gridCol w:w=\"3212\"/>"));
+        assert!(x.contains("<w:tc><w:tcPr><w:tcW w:w=\"1666\" w:type=\"pct\"/></w:tcPr><w:p/></w:tc>"));
+        assert!(x.contains("w:anchor=\"sec\""));
+        // Same URL: one relationship, shared across runs and tables.
+        let rels = read_part(&bytes, "word/_rels/document.xml.rels");
+        assert_eq!(rels.matches("/hyperlink\"").count(), 2, "{rels}");
+        assert!(rels.contains("TargetMode=\"External\"") && rels.contains("y=1&amp;z=2"));
+        let styles = read_part(&bytes, "word/styles.xml");
+        assert!(styles.contains("w:styleId=\"TableGrid\"") && styles.contains("w:styleId=\"Hyperlink\"") && styles.contains("0563C1"));
+        // rStyle must come first in rPr.
+        assert!(x.contains("<w:rPr><w:rStyle w:val=\"Hyperlink\"/><w:b/><w:bCs/></w:rPr>"));
+    }
+
+    #[test]
+    fn round_trip_tables_and_links() {
+        let doc = sample_doc();
+        let back = crate::formats::docx_reader::read(&write(&doc).unwrap()).unwrap();
+        assert_eq!(back.normalized(), doc.normalized());
     }
 }

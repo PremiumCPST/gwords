@@ -17,11 +17,11 @@
     </p>
     <p xml:lang="fr">Fonctionnalités principales :</p>
     <ul>
-      <li>Édition par onglets, avec recherche et remplacement</li>
-      <li>Mise en forme : gras, italique, souligné, barré, titres, alignements</li>
-      <li>Listes à puces et listes numérotées</li>
-      <li>Ouverture et enregistrement des formats .odt, .docx et .txt</li>
-      <li>Préférences : animations, police, taille du texte, thème clair ou sombre</li>
+      <li xml:lang="fr">Édition par onglets, avec recherche et remplacement</li>
+      <li xml:lang="fr">Mise en forme : gras, italique, souligné, barré, titres, alignements</li>
+      <li xml:lang="fr">Listes à puces et listes numérotées</li>
+      <li xml:lang="fr">Ouverture et enregistrement des formats .odt, .docx et .txt</li>
+      <li xml:lang="fr">Préférences : animations, police, taille du texte, thème clair ou sombre</li>
     </ul>
     <p>
       Gwords is a word processor for GNOME, written in Rust with GTK 4 and libadwaita.
@@ -45,6 +45,24 @@
   </keywords>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.1.1" date="2026-10-15">
+      <description>
+        <p xml:lang="fr">Mode avancé, activable depuis le menu principal, qui ajoute :</p>
+        <ul>
+          <li xml:lang="fr">des tableaux, avec insertion de lignes et de colonnes et cellules en texte riche</li>
+          <li xml:lang="fr">des caractères spéciaux</li>
+          <li xml:lang="fr">des liens hypertexte</li>
+          <li xml:lang="fr">le changement de casse du texte sélectionné</li>
+          <li xml:lang="fr">l'insertion de la date et de l'heure</li>
+          <li xml:lang="fr">les statistiques du document</li>
+        </ul>
+        <p xml:lang="fr">Corrections :</p>
+        <ul>
+          <li xml:lang="fr">l'animation de frappe pouvait laisser du texte masqué</li>
+          <li xml:lang="fr">le compteur de mots tient compte du texte des tableaux</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-10-15">
       <description>
         <p xml:lang="fr">Première version publique.</p>

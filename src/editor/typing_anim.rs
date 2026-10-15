@@ -190,7 +190,10 @@ impl TypingAnimator {
             st.anims.push(Anim {
                 start_mark,
                 end_mark,
-                start: None,
+                // Timed from the insertion itself (not from the first frame
+                // that draws it): a view that is redrawn late, e.g. a table
+                // cell, must never keep a stale cover over its text.
+                start: Some(glib::monotonic_time()),
             });
             if st.anims.len() > MAX_ANIMS {
                 st.anims.remove(0).delete_marks();
@@ -205,8 +208,8 @@ impl TypingAnimator {
             return;
         }
         let this = self.clone();
-        let id = view.add_tick_callback(move |v, clock| {
-            let now = clock.frame_time();
+        let id = view.add_tick_callback(move |v, _clock| {
+            let now = glib::monotonic_time();
             let done = {
                 let mut st = this.state.borrow_mut();
                 let mut i = 0;
@@ -243,10 +246,7 @@ impl TypingAnimator {
         if st.anims.is_empty() {
             return;
         }
-        let Some(clock) = view.frame_clock() else {
-            return;
-        };
-        let now = clock.frame_time();
+        let now = glib::monotonic_time();
         let buffer = view.buffer();
         let selection = buffer.selection_bounds().map(|(a, b)| (a.offset(), b.offset()));
         let bg = crate::theme::page_background();

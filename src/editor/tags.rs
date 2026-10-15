@@ -14,6 +14,12 @@
 //! NOT part of the document model (converters strip/insert it).
 //!
 //! Transient tags (`anim-*`, `search-*`) are visual only and ignored by converters.
+//!
+//! Links: char-level dynamic tag `link:<url>` (underlined, link-colored).
+//!
+//! Tables: a table occupies its own line made of exactly one
+//! `gtk::TextChildAnchor` (U+FFFC) whose child widget is an
+//! `editor::table::TableWidget`; that line carries no paragraph tags.
 
 use gtk::prelude::*;
 use gtk::{pango, TextBuffer, TextTag};
@@ -49,6 +55,7 @@ pub const FONT_PREFIX: &str = "font:";
 pub const SIZE_PREFIX: &str = "size:";
 pub const COLOR_PREFIX: &str = "color:";
 pub const HIGHLIGHT_PREFIX: &str = "highlight:";
+pub const LINK_PREFIX: &str = "link:";
 
 pub const BULLET_MARKER: &str = "• ";
 
@@ -132,6 +139,10 @@ pub fn highlight_tag_name(c: Rgb) -> String {
     format!("{HIGHLIGHT_PREFIX}{}", c.to_hex())
 }
 
+pub fn link_tag_name(url: &str) -> String {
+    format!("{LINK_PREFIX}{url}")
+}
+
 /// True for tags that are purely visual and must be ignored by converters.
 pub fn is_transient_tag(name: &str) -> bool {
     name.starts_with("anim-") || name.starts_with("search-")
@@ -200,8 +211,11 @@ pub fn install_tags(buffer: &TextBuffer) {
         .build());
 }
 
+/// Color of hyperlinks (GNOME blue 3, readable on light and dark pages).
+pub const LINK_COLOR: Rgb = Rgb(0x35, 0x84, 0xe4);
+
 /// Returns the tag with this name, creating dynamic (`font:`, `size:`,
-/// `color:`, `highlight:`) tags on demand. Returns `None` for an unknown
+/// `color:`, `highlight:`, `link:`) tags on demand. Returns `None` for an unknown
 /// static name or an unparsable dynamic value.
 pub fn ensure_tag(buffer: &TextBuffer, name: &str) -> Option<TextTag> {
     let table = buffer.tag_table();
@@ -217,6 +231,15 @@ pub fn ensure_tag(buffer: &TextBuffer, name: &str) -> Option<TextTag> {
         TextTag::builder().name(name).foreground_rgba(&rgba(Rgb::from_hex(hex)?)).build()
     } else if let Some(hex) = name.strip_prefix(HIGHLIGHT_PREFIX) {
         TextTag::builder().name(name).background_rgba(&rgba(Rgb::from_hex(hex)?)).build()
+    } else if let Some(url) = name.strip_prefix(LINK_PREFIX) {
+        if url.is_empty() {
+            return None;
+        }
+        TextTag::builder()
+            .name(name)
+            .underline(pango::Underline::Single)
+            .foreground_rgba(&rgba(LINK_COLOR))
+            .build()
     } else {
         return None;
     };
@@ -234,6 +257,7 @@ mod tests {
         assert_eq!(color_tag_name(Rgb(255, 0, 16)), "color:ff0010");
         assert!(is_transient_tag("anim-fade-3"));
         assert!(!is_transient_tag("bold"));
+        assert_eq!(link_tag_name("https://gnome.org"), "link:https://gnome.org");
         assert_eq!(paragraph_style_from_tag(PARA_H2), Some(ParagraphStyle::Heading2));
     }
 }

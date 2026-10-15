@@ -15,6 +15,21 @@ accompagnent la frappe, la mise en forme et l'ouverture des documents.
   thème clair ou sombre
 - Intégration au bureau GNOME : fichier `.desktop`, métadonnées AppStream et icônes
 
+### Mode avancé
+
+Le mode avancé ajoute une seconde barre d'outils sous la barre principale. Pour l'activer ou le
+désactiver, ouvrez le menu principal et cochez **Mode avancé** (raccourci `Ctrl+Maj+A`). Il propose :
+
+- **Tableaux** : insertion, ajout et suppression de lignes et de colonnes ; chaque cellule accepte
+  du texte mis en forme. Les tableaux sont lus et écrits en `.odt`, `.docx` et `.txt` (en texte brut,
+  chaque ligne du tableau devient une ligne séparée par des tabulations).
+- **Caractères spéciaux** : insertion de symboles et de caractères typographiques.
+- **Liens hypertexte** : ajout ou modification d'un lien sur le texte sélectionné (`Ctrl+K`).
+- **Changement de casse** : majuscules, minuscules, initiale de chaque mot ou début de phrase.
+- **Date et heure** : insertion de la date et de l'heure courantes.
+- **Statistiques du document** : nombre de mots, de caractères, de paragraphes et de tableaux,
+  et durée de lecture estimée.
+
 ## Installation
 
 Gwords est distribué uniquement en **Flatpak**, ce qui le rend utilisable sur toutes les distributions
@@ -76,6 +91,7 @@ Pour développer sans Flatpak (avec Rust, GTK 4.20+ et libadwaita 1.7+ installé
 | Ouvrir un document              | Ctrl+O               |
 | Enregistrer                     | Ctrl+S               |
 | Enregistrer sous                | Ctrl+Maj+S           |
+| Mode avancé                     | Ctrl+Maj+A           |
 | Fermer l'onglet                 | Ctrl+W               |
 | Rechercher                      | Ctrl+F               |
 | Rechercher et remplacer         | Ctrl+H               |
@@ -91,6 +107,7 @@ Pour développer sans Flatpak (avec Rust, GTK 4.20+ et libadwaita 1.7+ installé
 | Liste à puces                   | Ctrl+Maj+8           |
 | Liste numérotée                 | Ctrl+Maj+7           |
 | Effacer la mise en forme        | Ctrl+M               |
+| Lien hypertexte                 | Ctrl+K               |
 | Préférences                     | Ctrl+,               |
 | Quitter                         | Ctrl+Q               |
 

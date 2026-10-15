@@ -8,7 +8,9 @@ use zip::CompressionMethod;
 use zip::ZipWriter;
 use zip::write::SimpleFileOptions;
 
-use crate::document::{Alignment, CharStyle, Document, ListKind, Paragraph, ParagraphStyle, VerticalAlign};
+use crate::document::{
+    Alignment, Block, CharStyle, Document, ListKind, Paragraph, ParagraphStyle, Table, VerticalAlign,
+};
 use crate::formats::FormatError;
 
 const MIMETYPE: &str = "application/vnd.oasis.opendocument.text";
@@ -58,7 +60,13 @@ struct StyleSet {
     para: Vec<(String, String, Alignment)>, // (name, parent, align)
     para_idx: HashMap<(String, Alignment), String>,
     fonts: BTreeSet<String>,
+    /// Column count of each table written so far (table N has style `TableauN`).
+    tables: Vec<usize>,
 }
+
+/// Text width of the page (A4 minus 2 cm margins), in cm.
+const TABLE_WIDTH_CM: f64 = 17.0;
+const CELL_STYLE: &str = "TableauCell";
 
 impl StyleSet {
     fn text_style(&mut self, cs: &CharStyle) -> Option<String> {
@@ -136,6 +144,24 @@ impl StyleSet {
 <style:paragraph-properties fo:text-align=\"{a}\"/></style:style>"
             ));
         }
+        for (i, cols) in self.tables.iter().enumerate() {
+            let n = i + 1;
+            let cols = (*cols).max(1);
+            let width = TABLE_WIDTH_CM / cols as f64;
+            let rel = 65535 / cols;
+            o.push_str(&format!(
+                "<style:style style:name=\"Tableau{n}\" style:family=\"table\">\
+<style:table-properties style:width=\"{TABLE_WIDTH_CM:.3}cm\" style:rel-width=\"100%\" table:align=\"margins\"/></style:style>\
+<style:style style:name=\"Tableau{n}.A\" style:family=\"table-column\">\
+<style:table-column-properties style:column-width=\"{width:.3}cm\" style:rel-column-width=\"{rel}*\"/></style:style>"
+            ));
+        }
+        if !self.tables.is_empty() {
+            o.push_str(&format!(
+                "<style:style style:name=\"{CELL_STYLE}\" style:family=\"table-cell\">\
+<style:table-cell-properties fo:padding=\"0.1cm\" fo:border=\"0.5pt solid #000000\"/></style:style>"
+            ));
+        }
         for (props, name) in &self.text {
             o.push_str(&format!(
                 "<style:style style:name=\"{name}\" style:family=\"text\"><style:text-properties{props}/></style:style>"
@@ -178,9 +204,20 @@ fn write_paragraph(out: &mut String, p: &Paragraph, styles: &mut StyleSet) {
     out.push_str(&open);
     // prev_space: previous emitted char was a (literal or encoded) space.
     let mut prev_space = true; // paragraph start counts as whitespace
+    let mut open_link: Option<&str> = None;
     for run in &p.runs {
         if run.text.is_empty() {
             continue;
+        }
+        let link = run.style.link.as_deref().filter(|l| !l.is_empty());
+        if link != open_link {
+            if open_link.is_some() {
+                out.push_str("</text:a>");
+            }
+            if let Some(url) = link {
+                out.push_str(&format!("<text:a xlink:type=\"simple\" xlink:href=\"{}\">", esc(url)));
+            }
+            open_link = link;
         }
         let sname = styles.text_style(&run.style);
         if let Some(n) = &sname {
@@ -245,6 +282,9 @@ fn write_paragraph(out: &mut String, p: &Paragraph, styles: &mut StyleSet) {
         if sname.is_some() {
             out.push_str("</text:span>");
         }
+    }
+    if open_link.is_some() {
+        out.push_str("</text:a>");
     }
     out.push_str(close);
 }
@@ -389,15 +429,13 @@ fo:margin-top=\"2cm\" fo:margin-bottom=\"2cm\" fo:margin-left=\"2cm\" fo:margin-
     o
 }
 
-fn content_xml(doc: &Document) -> String {
-    let mut styles = StyleSet::default();
-    let mut body = String::new();
+/// Writes consecutive paragraphs, grouping list items into `text:list`.
+fn write_paragraphs(out: &mut String, paras: &[&Paragraph], styles: &mut StyleSet) {
     let mut i = 0;
-    let paras = &doc.paragraphs;
     while i < paras.len() {
         match paras[i].list {
             None => {
-                write_paragraph(&mut body, &paras[i], &mut styles);
+                write_paragraph(out, paras[i], styles);
                 i += 1;
             }
             Some(kind) => {
@@ -405,18 +443,64 @@ fn content_xml(doc: &Document) -> String {
                     ListKind::Bullet => "Bullet_20_List",
                     ListKind::Numbered => "Numbering_20_List",
                 };
-                body.push_str(&format!("<text:list text:style-name=\"{lname}\">"));
+                out.push_str(&format!("<text:list text:style-name=\"{lname}\">"));
                 while i < paras.len() && paras[i].list == Some(kind) {
-                    body.push_str("<text:list-item>");
-                    write_paragraph(&mut body, &paras[i], &mut styles);
-                    body.push_str("</text:list-item>");
+                    out.push_str("<text:list-item>");
+                    write_paragraph(out, paras[i], styles);
+                    out.push_str("</text:list-item>");
                     i += 1;
                 }
-                body.push_str("</text:list>");
+                out.push_str("</text:list>");
             }
         }
     }
-    if paras.is_empty() {
+}
+
+fn write_table(out: &mut String, table: &Table, styles: &mut StyleSet) {
+    let mut table = table.clone();
+    table.make_rectangular();
+    let cols = table.column_count();
+    styles.tables.push(cols);
+    let n = styles.tables.len();
+    out.push_str(&format!(
+        "<table:table table:name=\"Tableau{n}\" table:style-name=\"Tableau{n}\">\
+<table:table-column table:style-name=\"Tableau{n}.A\" table:number-columns-repeated=\"{cols}\"/>"
+    ));
+    for row in &table.rows {
+        out.push_str("<table:table-row>");
+        for cell in &row.cells {
+            out.push_str(&format!(
+                "<table:table-cell table:style-name=\"{CELL_STYLE}\" office:value-type=\"string\">"
+            ));
+            if cell.paragraphs.is_empty() {
+                out.push_str("<text:p text:style-name=\"Standard\"/>");
+            } else {
+                let paras: Vec<&Paragraph> = cell.paragraphs.iter().collect();
+                write_paragraphs(out, &paras, styles);
+            }
+            out.push_str("</table:table-cell>");
+        }
+        out.push_str("</table:table-row>");
+    }
+    out.push_str("</table:table>");
+}
+
+fn content_xml(doc: &Document) -> String {
+    let mut styles = StyleSet::default();
+    let mut body = String::new();
+    let mut pending: Vec<&Paragraph> = Vec::new();
+    for block in &doc.blocks {
+        match block {
+            Block::Paragraph(p) => pending.push(p),
+            Block::Table(t) => {
+                write_paragraphs(&mut body, &pending, &mut styles);
+                pending.clear();
+                write_table(&mut body, t, &mut styles);
+            }
+        }
+    }
+    write_paragraphs(&mut body, &pending, &mut styles);
+    if doc.blocks.is_empty() {
         body.push_str("<text:p text:style-name=\"Standard\"/>");
     }
     let mut o = String::new();
@@ -492,7 +576,7 @@ pub fn write(doc: &Document) -> Result<Vec<u8>, FormatError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{Metadata, Rgb, Run};
+    use crate::document::{Metadata, Rgb, Run, TableCell, TableRow};
     use std::io::Read;
 
     fn read_entry(bytes: &[u8], name: &str) -> String {
@@ -520,18 +604,18 @@ mod tests {
         let bold = CharStyle { bold: true, color: Some(Rgb(255, 0, 0)), font_family: Some("Foo & Bar".into()), ..Default::default() };
         Document {
             metadata: Metadata { title: Some("T <1>".into()), author: Some("Moi".into()) },
-            paragraphs: vec![
-                Paragraph { style: ParagraphStyle::Title, runs: vec![Run::plain("Titre")], ..Default::default() },
-                Paragraph { style: ParagraphStyle::Heading2, alignment: Alignment::Center, runs: vec![Run::plain("H2")], ..Default::default() },
-                Paragraph {
+            blocks: vec![
+                Block::Paragraph(Paragraph { style: ParagraphStyle::Title, runs: vec![Run::plain("Titre")], ..Default::default() }),
+                Block::Paragraph(Paragraph { style: ParagraphStyle::Heading2, alignment: Alignment::Center, runs: vec![Run::plain("H2")], ..Default::default() }),
+                Block::Paragraph(Paragraph {
                     alignment: Alignment::Center,
                     runs: vec![run("a", bold.clone()), run("b", bold.clone()), Run::plain("x &  <y>   z\tw\u{2028}v")],
                     ..Default::default()
-                },
-                Paragraph { runs: vec![Run::plain(" lead")], ..Default::default() },
-                Paragraph { list: Some(ListKind::Bullet), runs: vec![Run::plain("one")], ..Default::default() },
-                Paragraph { list: Some(ListKind::Bullet), runs: vec![Run::plain("two")], ..Default::default() },
-                Paragraph { list: Some(ListKind::Numbered), runs: vec![Run::plain("n")], ..Default::default() },
+                }),
+                Block::Paragraph(Paragraph { runs: vec![Run::plain(" lead")], ..Default::default() }),
+                Block::Paragraph(Paragraph { list: Some(ListKind::Bullet), runs: vec![Run::plain("one")], ..Default::default() }),
+                Block::Paragraph(Paragraph { list: Some(ListKind::Bullet), runs: vec![Run::plain("two")], ..Default::default() }),
+                Block::Paragraph(Paragraph { list: Some(ListKind::Numbered), runs: vec![Run::plain("n")], ..Default::default() }),
             ],
         }
     }
@@ -571,5 +655,106 @@ mod tests {
         assert_eq!(c.matches("<text:list-item>").count(), 3);
         assert!(c.contains("style:font-name=\"Foo &amp; Bar\""));
         assert!(c.contains("fo:color=\"#ff0000\""));
+    }
+
+    fn para(runs: Vec<Run>) -> Paragraph {
+        Paragraph { runs, ..Default::default() }
+    }
+
+    fn link_style(url: &str) -> CharStyle {
+        CharStyle { link: Some(url.into()), ..Default::default() }
+    }
+
+    fn cell(paragraphs: Vec<Paragraph>) -> TableCell {
+        TableCell { paragraphs }
+    }
+
+    fn table_doc() -> Document {
+        let bold = CharStyle { bold: true, ..Default::default() };
+        let bold_link = CharStyle { bold: true, link: Some("https://a.example/?x=1&y=<2>".into()), ..Default::default() };
+        let t = Table {
+            rows: vec![
+                TableRow {
+                    cells: vec![
+                        cell(vec![para(vec![run("gras", bold.clone()), Run::plain(" et  normal")])]),
+                        cell(vec![]),
+                        cell(vec![
+                            Paragraph { list: Some(ListKind::Bullet), runs: vec![Run::plain("l1")], ..Default::default() },
+                            Paragraph { list: Some(ListKind::Bullet), runs: vec![Run::plain("l2")], ..Default::default() },
+                            Paragraph { list: Some(ListKind::Numbered), runs: vec![Run::plain("n1")], ..Default::default() },
+                            para(vec![Run::plain("apr\u{e8}s")]),
+                        ]),
+                    ],
+                },
+                TableRow {
+                    cells: vec![
+                        cell(vec![para(vec![
+                            Run::plain("voir "),
+                            run("lien", link_style("http://x.org")),
+                            run("gras", bold_link.clone()),
+                            run("suite", link_style("http://y.org")),
+                            run("fin", bold.clone()),
+                        ])]),
+                        cell(vec![Paragraph::default()]),
+                        cell(vec![
+                            Paragraph { style: ParagraphStyle::Heading1, alignment: Alignment::Right, runs: vec![Run::plain("T")], ..Default::default() },
+                            Paragraph::default(),
+                        ]),
+                    ],
+                },
+            ],
+        };
+        Document {
+            metadata: Metadata::default(),
+            blocks: vec![
+                Block::Paragraph(para(vec![
+                    run("a", link_style("http://top.org")),
+                    run(" b ", link_style("http://top.org")),
+                    run("c", bold.clone()),
+                ])),
+                Block::Table(t),
+                Block::Table(Table::new(1, 1)),
+                Block::Paragraph(Paragraph { list: Some(ListKind::Numbered), runs: vec![Run::plain("z")], ..Default::default() }),
+            ],
+        }
+    }
+
+    #[test]
+    fn table_and_link_markup() {
+        let bytes = write(&table_doc()).unwrap();
+        for n in ["content.xml", "styles.xml"] {
+            well_formed(&read_entry(&bytes, n));
+        }
+        let c = read_entry(&bytes, "content.xml");
+        assert_eq!(c.matches("<table:table ").count(), 2);
+        assert!(c.contains("table:name=\"Tableau1\" table:style-name=\"Tableau1\""));
+        assert!(c.contains("table:name=\"Tableau2\""));
+        assert!(c.contains("table:number-columns-repeated=\"3\""));
+        assert_eq!(c.matches("<table:table-row>").count(), 3);
+        assert_eq!(c.matches("<table:table-cell ").count(), 7);
+        assert!(c.contains("style:family=\"table\""));
+        assert!(c.contains("style:family=\"table-column\""));
+        assert!(c.contains("fo:border=\"0.5pt solid #000000\""));
+        assert!(c.contains("fo:padding=\"0.1cm\""));
+        // Consecutive runs with the same link share one anchor, spans stay inside.
+        assert!(c.contains("<text:a xlink:type=\"simple\" xlink:href=\"http://top.org\">a b </text:a>"));
+        assert!(c.contains("xlink:href=\"https://a.example/?x=1&amp;y=&lt;2&gt;\"><text:span"));
+        assert_eq!(c.matches("</text:a>").count(), c.matches("<text:a ").count());
+    }
+
+    #[test]
+    fn roundtrip_tables_and_links() {
+        let doc = table_doc();
+        let bytes = write(&doc).unwrap();
+        let back = crate::formats::odt_reader::read(&bytes).unwrap();
+        assert_eq!(back.normalized(), doc.normalized());
+    }
+
+    #[test]
+    fn roundtrip_table_only_and_empty_cells() {
+        let doc = Document { metadata: Metadata::default(), blocks: vec![Block::Table(Table::new(3, 2))] };
+        let back = crate::formats::odt_reader::read(&write(&doc).unwrap()).unwrap();
+        assert_eq!(back.normalized(), doc.normalized());
+        assert_eq!(back.blocks.len(), 1);
     }
 }

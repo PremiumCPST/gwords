@@ -1,4 +1,4 @@
-use crate::document::{Document, ListKind};
+use crate::document::{Block, Document, ListKind, Paragraph, TableCell};
 use crate::formats::FormatError;
 
 /// Windows-1252 mapping for bytes 0x80..=0x9F (the rest of the range is identical to Latin-1).
@@ -21,35 +21,58 @@ pub fn read(bytes: &[u8]) -> Result<Document, FormatError> {
     Ok(Document::from_plain_text(&normalized))
 }
 
+/// Writes paragraphs as lines and each table row as one tab-separated line.
+/// Cell paragraphs are joined with a space; no list markers are added inside cells.
 pub fn write(doc: &Document) -> Result<Vec<u8>, FormatError> {
     // A trailing empty plain paragraph is what reading "...\n" produces; it is the
     // file's final newline, not a visible blank line, so it is not written twice.
-    let mut paragraphs = doc.paragraphs.as_slice();
-    if let [rest @ .., last] = paragraphs {
+    let mut blocks = doc.blocks.as_slice();
+    if let [rest @ .., Block::Paragraph(last)] = blocks {
         if !rest.is_empty() && last.list.is_none() && last.plain_text().is_empty() {
-            paragraphs = rest;
+            blocks = rest;
         }
     }
 
     let mut out = String::new();
     let mut number = 0u32;
-    for paragraph in paragraphs {
-        let text = paragraph.plain_text().replace('\u{2028}', "\n");
-        match &paragraph.list {
-            Some(ListKind::Bullet) => {
+    for block in blocks {
+        match block {
+            Block::Paragraph(paragraph) => {
+                let text = paragraph.plain_text().replace('\u{2028}', "\n");
+                match &paragraph.list {
+                    Some(ListKind::Bullet) => {
+                        number = 0;
+                        out.push_str("• ");
+                    }
+                    Some(ListKind::Numbered) => {
+                        number += 1;
+                        out.push_str(&format!("{number}. "));
+                    }
+                    None => number = 0,
+                }
+                out.push_str(&text);
+                out.push('\n');
+            }
+            Block::Table(table) => {
                 number = 0;
-                out.push_str("• ");
+                for row in &table.rows {
+                    let line: Vec<String> = row.cells.iter().map(cell_text).collect();
+                    out.push_str(&line.join("\t"));
+                    out.push('\n');
+                }
             }
-            Some(ListKind::Numbered) => {
-                number += 1;
-                out.push_str(&format!("{number}. "));
-            }
-            None => number = 0,
         }
-        out.push_str(&text);
-        out.push('\n');
     }
     Ok(out.into_bytes())
+}
+
+/// One table cell as a single line of text: paragraphs joined by a space.
+fn cell_text(cell: &TableCell) -> String {
+    cell.paragraphs
+        .iter()
+        .map(|p: &Paragraph| p.plain_text().replace(['\u{2028}', '\n'], " "))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Decodes bytes as Windows-1252. Every byte maps to a character, so this never fails.
@@ -66,7 +89,7 @@ fn decode_windows_1252(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::{Paragraph, Run};
+    use crate::document::{Run, Table, TableRow};
 
     fn para(text: &str, list: Option<ListKind>) -> Paragraph {
         Paragraph {
@@ -77,11 +100,18 @@ mod tests {
     }
 
     fn doc(paragraphs: Vec<Paragraph>) -> Document {
-        Document { paragraphs, ..Default::default() }
+        Document {
+            blocks: paragraphs.into_iter().map(Block::Paragraph).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn cell(paragraphs: Vec<Paragraph>) -> TableCell {
+        TableCell { paragraphs }
     }
 
     fn text_of(doc: &Document) -> String {
-        doc.paragraphs.iter().map(|p| p.plain_text()).collect::<Vec<_>>().join("\n")
+        doc.paragraphs().map(|p| p.plain_text()).collect::<Vec<_>>().join("\n")
     }
 
     #[test]
@@ -90,7 +120,7 @@ mod tests {
         bytes.extend_from_slice("a\r\nb\rc\n".as_bytes());
         let doc = read(&bytes).unwrap();
         assert_eq!(text_of(&doc), "a\nb\nc\n");
-        assert_eq!(doc.paragraphs.len(), 4);
+        assert_eq!(doc.blocks.len(), 4);
     }
 
     #[test]
@@ -136,6 +166,32 @@ mod tests {
         let d = doc(vec![para("ligne1\u{2028}ligne2", None)]);
         let out = String::from_utf8(write(&d).unwrap()).unwrap();
         assert_eq!(out, "ligne1\nligne2\n");
+    }
+
+    #[test]
+    fn write_table_as_tab_separated_rows() {
+        let table = Table {
+            rows: vec![
+                TableRow { cells: vec![cell(vec![para("a", None)]), cell(vec![para("b", None)])] },
+                TableRow {
+                    cells: vec![
+                        cell(vec![para("c", None), para("d", None)]),
+                        cell(vec![para("e\u{2028}f", None)]),
+                    ],
+                },
+                TableRow { cells: vec![TableCell::default(), cell(vec![para("g", None)])] },
+            ],
+        };
+        let d = Document {
+            blocks: vec![
+                Block::Paragraph(para("Avant", None)),
+                Block::Table(table),
+                Block::Paragraph(para("Après", None)),
+            ],
+            ..Default::default()
+        };
+        let out = String::from_utf8(write(&d).unwrap()).unwrap();
+        assert_eq!(out, "Avant\na\tb\nc d\te f\n\tg\nAprès\n");
     }
 
     #[test]

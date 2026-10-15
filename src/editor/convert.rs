@@ -9,10 +9,11 @@
 use std::collections::HashMap;
 
 use gtk::prelude::*;
-use gtk::{TextBuffer, TextTag};
+use gtk::{TextBuffer, TextChildAnchor, TextTag};
 
 use super::tags;
-use crate::document::{CharStyle, Document, ListKind, Paragraph, Rgb, Run};
+use super::table::TableWidget;
+use crate::document::{Block, CharStyle, Document, ListKind, Paragraph, Rgb, Run, Table};
 
 /// Names of the character-level tags for a style.
 fn char_tag_names(style: &CharStyle) -> Vec<String> {
@@ -44,17 +45,47 @@ fn char_tag_names(style: &CharStyle) -> Vec<String> {
     if let Some(c) = style.highlight {
         v.push(tags::highlight_tag_name(c));
     }
+    if let Some(u) = &style.link {
+        v.push(tags::link_tag_name(u));
+    }
     v
 }
 
-/// Clears `buffer` and fills it with `doc`. Calls `tags::install_tags` first.
-pub fn load_into_buffer(buffer: &TextBuffer, doc: &Document) {
+/// Clears `buffer` and fills it with the blocks of `doc`. For each table,
+/// inserts a line containing exactly one TextChildAnchor (lines are separated by '\n'
+/// like paragraphs) and returns the anchors with their tables, in document order.
+/// The caller (Editor) creates a TableWidget per anchor (view.add_child_at_anchor).
+pub fn load_into_buffer(buffer: &TextBuffer, doc: &Document) -> Vec<(TextChildAnchor, Table)> {
+    let items: Vec<Item> = doc
+        .blocks
+        .iter()
+        .map(|b| match b {
+            Block::Paragraph(p) => Item::P(p),
+            Block::Table(t) => Item::T(t),
+        })
+        .collect();
+    load_items(buffer, &items)
+}
+
+/// Paragraph-only variant used for table cells: fills `buffer` with `paragraphs`.
+pub fn load_paragraphs(buffer: &TextBuffer, paragraphs: &[Paragraph]) {
+    let items: Vec<Item> = paragraphs.iter().map(Item::P).collect();
+    load_items(buffer, &items);
+}
+
+enum Item<'a> {
+    P(&'a Paragraph),
+    T(&'a Table),
+}
+
+fn load_items(buffer: &TextBuffer, items: &[Item]) -> Vec<(TextChildAnchor, Table)> {
     tags::install_tags(buffer);
 
     let mut text = String::new();
     let mut len: i32 = 0; // length in chars
     // (start, end, tag name) in char offsets
     let mut ranges: Vec<(i32, i32, String)> = Vec::new();
+    let mut anchors_at: Vec<(i32, &Table)> = Vec::new();
     let mut numbered = 0usize;
 
     let push = |text: &mut String, len: &mut i32, s: &str| {
@@ -62,8 +93,20 @@ pub fn load_into_buffer(buffer: &TextBuffer, doc: &Document) {
         *len += s.chars().count() as i32;
     };
 
-    let last = doc.paragraphs.len().saturating_sub(1);
-    for (i, p) in doc.paragraphs.iter().enumerate() {
+    let last = items.len().saturating_sub(1);
+    for (i, item) in items.iter().enumerate() {
+        let p = match item {
+            Item::T(t) => {
+                numbered = 0;
+                anchors_at.push((len, t));
+                push(&mut text, &mut len, "\u{FFFC}");
+                if i != last {
+                    push(&mut text, &mut len, "\n");
+                }
+                continue;
+            }
+            Item::P(p) => *p,
+        };
         let line_start = len;
         match p.list {
             Some(kind) => {
@@ -123,70 +166,111 @@ pub fn load_into_buffer(buffer: &TextBuffer, doc: &Document) {
             buffer.apply_tag(&tag, &buffer.iter_at_offset(s), &buffer.iter_at_offset(e));
         }
     }
+
+    // Replace each placeholder by a real child anchor (same width: offsets stay valid).
+    let mut out = Vec::new();
+    for (off, table) in anchors_at {
+        let mut start = buffer.iter_at_offset(off);
+        let mut end = buffer.iter_at_offset(off + 1);
+        buffer.delete(&mut start, &mut end);
+        let mut it = buffer.iter_at_offset(off);
+        let anchor = buffer.create_child_anchor(&mut it);
+        out.push((anchor, table.clone()));
+    }
+    out
 }
 
-/// Reads the whole buffer back into a document model.
+/// Reads the buffer back. A line made of exactly one child anchor whose first
+/// widget is a `TableWidget` becomes `Block::Table`; an anchor with no
+/// TableWidget is skipped.
 pub fn buffer_to_document(buffer: &TextBuffer) -> Document {
-    let mut paragraphs = Vec::new();
-    let line_count = buffer.line_count();
-    for line in 0..line_count {
+    let mut blocks = Vec::new();
+    for line in 0..buffer.line_count() {
         let Some(start) = buffer.iter_at_line(line) else { break };
-        let mut end = start.clone();
-        if !end.ends_line() {
-            end.forward_to_line_end();
-        }
-        let mut para = Paragraph::default();
-
-        // Paragraph-level tags from the first char (or the '\n' of an empty line).
-        if !start.is_end() {
-            for tag in start.tags() {
-                let Some(name) = tag.name() else { continue };
-                let name = name.as_str();
-                if let Some(s) = tags::paragraph_style_from_tag(name) {
-                    para.style = s;
-                } else if let Some(a) = tags::alignment_from_tag(name) {
-                    para.alignment = a;
-                } else if let Some(l) = tags::list_from_tag(name) {
-                    para.list = Some(l);
+        if let Some(anchor) = start.child_anchor() {
+            let mut end = start.clone();
+            if !end.ends_line() {
+                end.forward_to_line_end();
+            }
+            let mut after = start.clone();
+            after.forward_char();
+            if after == end {
+                if let Some(w) = anchor.widgets().into_iter().find_map(|w| w.downcast::<TableWidget>().ok()) {
+                    blocks.push(Block::Table(w.to_table()));
                 }
+                continue;
             }
         }
-
-        let mut pos = start.clone();
-        while pos < end {
-            let mut next = pos.clone();
-            if !next.forward_to_tag_toggle(None::<&TextTag>) || next > end {
-                next = end.clone();
-            }
-            let mut style = CharStyle::default();
-            let mut marker = false;
-            for tag in pos.tags() {
-                let Some(name) = tag.name() else { continue };
-                let name = name.as_str();
-                if name == tags::LIST_MARKER {
-                    marker = true;
-                } else if !tags::is_transient_tag(name) {
-                    apply_tag_name(&mut style, name);
-                }
-            }
-            if !marker {
-                let seg: String = buffer
-                    .text(&pos, &next, false)
-                    .chars()
-                    .filter(|c| *c != '\u{FFFC}' && *c != '\n')
-                    .collect();
-                if !seg.is_empty() {
-                    match para.runs.last_mut() {
-                        Some(last) if last.style == style => last.text.push_str(&seg),
-                        _ => para.runs.push(Run { text: seg, style }),
-                    }
-                }
-            }
-            pos = next;
-        }
-        paragraphs.push(para);
+        blocks.push(Block::Paragraph(read_line(buffer, line)));
     }
-    Document { metadata: Default::default(), paragraphs }
+    Document { metadata: Default::default(), blocks }
+}
+
+/// Reads the buffer as paragraphs (table cells). An empty buffer gives an
+/// empty vector.
+pub fn buffer_to_paragraphs(buffer: &TextBuffer) -> Vec<Paragraph> {
+    if buffer.char_count() == 0 {
+        return Vec::new();
+    }
+    (0..buffer.line_count()).map(|l| read_line(buffer, l)).collect()
+}
+
+fn read_line(buffer: &TextBuffer, line: i32) -> Paragraph {
+    let mut para = Paragraph::default();
+    let Some(start) = buffer.iter_at_line(line) else { return para };
+    let mut end = start.clone();
+    if !end.ends_line() {
+        end.forward_to_line_end();
+    }
+
+    // Paragraph-level tags from the first char (or the '\n' of an empty line).
+    if !start.is_end() {
+        for tag in start.tags() {
+            let Some(name) = tag.name() else { continue };
+            let name = name.as_str();
+            if let Some(s) = tags::paragraph_style_from_tag(name) {
+                para.style = s;
+            } else if let Some(a) = tags::alignment_from_tag(name) {
+                para.alignment = a;
+            } else if let Some(l) = tags::list_from_tag(name) {
+                para.list = Some(l);
+            }
+        }
+    }
+
+    let mut pos = start.clone();
+    while pos < end {
+        let mut next = pos.clone();
+        if !next.forward_to_tag_toggle(None::<&TextTag>) || next > end {
+            next = end.clone();
+        }
+        let mut style = CharStyle::default();
+        let mut marker = false;
+        for tag in pos.tags() {
+            let Some(name) = tag.name() else { continue };
+            let name = name.as_str();
+            if name == tags::LIST_MARKER {
+                marker = true;
+            } else if !tags::is_transient_tag(name) {
+                apply_tag_name(&mut style, name);
+            }
+        }
+        if !marker {
+            let seg: String = buffer
+                .text(&pos, &next, false)
+                .chars()
+                .filter(|c| *c != '\u{FFFC}' && *c != '\n')
+                .collect();
+            if !seg.is_empty() {
+                match para.runs.last_mut() {
+                    Some(last) if last.style == style => last.text.push_str(&seg),
+                    _ => para.runs.push(Run { text: seg, style }),
+                }
+            }
+        }
+        pos = next;
+    }
+    para
 }
 
 fn apply_tag_name(style: &mut CharStyle, name: &str) {
@@ -206,6 +290,8 @@ fn apply_tag_name(style: &mut CharStyle, name: &str) {
                 style.color = Rgb::from_hex(c);
             } else if let Some(c) = name.strip_prefix(tags::HIGHLIGHT_PREFIX) {
                 style.highlight = Rgb::from_hex(c);
+            } else if let Some(u) = name.strip_prefix(tags::LINK_PREFIX) {
+                style.link = Some(u.to_string());
             }
         }
     }
@@ -226,6 +312,10 @@ pub(crate) mod tests {
         Paragraph { style, alignment, list, runs }
     }
 
+    fn doc(ps: Vec<Paragraph>) -> Document {
+        Document { blocks: ps.into_iter().map(Block::Paragraph).collect(), ..Default::default() }
+    }
+
     // Run from crate::gtk_tests (GTK is single-threaded).
     pub(crate) fn roundtrip() {
         if gtk::init().is_err() {
@@ -234,9 +324,8 @@ pub(crate) mod tests {
         use ParagraphStyle::*;
         let n = Alignment::Left;
         let docs = vec![
-            Document { paragraphs: vec![para(Normal, n, None, vec![])], ..Default::default() },
-            Document {
-                paragraphs: vec![
+            doc(vec![para(Normal, n, None, vec![])]),
+            doc(vec![
                     para(Title, Alignment::Center, None, vec![Run::plain("Titre")]),
                     para(Heading1, n, None, vec![run("Gras", |s| s.bold = true), Run::plain(" et "), run("it", |s| {
                         s.italic = true;
@@ -254,16 +343,14 @@ pub(crate) mod tests {
                         }),
                         run("x2", |s| s.vertical = VerticalAlign::Superscript),
                         run("x", |s| s.vertical = VerticalAlign::Subscript),
+                        run("lien", |s| s.link = Some("https://gnome.org".into())),
                     ]),
                     para(Quote, Alignment::Right, None, vec![Run::plain("a\tb\u{2028}c")]),
                     para(Code, n, None, vec![]),
                     para(Normal, n, None, vec![Run::plain("héllo 🎉 日本語")]),
                     para(Normal, n, None, vec![]),
-                ],
-                ..Default::default()
-            },
-            Document {
-                paragraphs: vec![
+                ]),
+            doc(vec![
                     para(Normal, n, Some(ListKind::Bullet), vec![Run::plain("puce")]),
                     para(Normal, n, Some(ListKind::Numbered), vec![Run::plain("un")]),
                     para(Normal, n, Some(ListKind::Numbered), vec![]),
@@ -271,28 +358,60 @@ pub(crate) mod tests {
                     para(Normal, n, None, vec![Run::plain("rupture")]),
                     para(Heading2, Alignment::Center, Some(ListKind::Numbered), vec![Run::plain("repart")]),
                     para(Normal, n, Some(ListKind::Bullet), vec![]),
-                ],
-                ..Default::default()
-            },
-            Document { paragraphs: vec![], ..Default::default() },
+                ]),
+            doc(vec![]),
         ];
         for (i, doc) in docs.iter().enumerate() {
             let buf = TextBuffer::new(None);
             load_into_buffer(&buf, doc);
             let back = buffer_to_document(&buf);
-            if doc.paragraphs.is_empty() {
-                assert_eq!(back.paragraphs.len(), 1);
+            if doc.blocks.is_empty() {
+                assert_eq!(back.blocks.len(), 1);
                 continue;
             }
-            assert_eq!(&back, doc, "doc {i}");
+            assert_eq!(back, doc.normalized(), "doc {i}");
             // Reloading into the same buffer works too.
             load_into_buffer(&buf, doc);
-            assert_eq!(&buffer_to_document(&buf), doc, "reload doc {i}");
+            assert_eq!(buffer_to_document(&buf), doc.normalized(), "reload doc {i}");
         }
 
         let buf = TextBuffer::new(None);
         load_into_buffer(&buf, &docs[2]);
         let text = buf.text(&buf.start_iter(), &buf.end_iter(), false);
         assert_eq!(text, "• puce\n1. un\n2. \n3. trois\nrupture\n1. repart\n• ");
+
+        // Cells.
+        let cell = vec![para(Normal, n, None, vec![Run::plain("a")]), para(Normal, n, Some(ListKind::Bullet), vec![])];
+        let buf = TextBuffer::new(None);
+        load_paragraphs(&buf, &cell);
+        assert_eq!(buffer_to_paragraphs(&buf), cell);
+        load_paragraphs(&buf, &[]);
+        assert!(buffer_to_paragraphs(&buf).is_empty());
+
+        // Tables: anchors at the expected lines; widget-less anchors are skipped.
+        let mut t1 = Table::new(2, 2);
+        t1.rows[0].cells[0].paragraphs = cell.clone();
+        let t2 = Table::new(1, 1);
+        let p = |s: &str| Block::Paragraph(para(Normal, n, None, vec![Run::plain(s)]));
+        let d = Document {
+            blocks: vec![Block::Table(t1.clone()), p("x"), Block::Table(t2.clone()), p("y"), Block::Table(t1.clone())],
+            ..Default::default()
+        };
+        let buf = TextBuffer::new(None);
+        let anchors = load_into_buffer(&buf, &d);
+        assert_eq!(anchors.len(), 3);
+        assert_eq!(anchors[0].1, t1);
+        assert_eq!(anchors[1].1, t2);
+        assert_eq!(buf.line_count(), 5);
+        for (anchor, line) in [(&anchors[0].0, 0), (&anchors[1].0, 2), (&anchors[2].0, 4)] {
+            let it = buf.iter_at_line(line).unwrap();
+            assert_eq!(it.child_anchor().as_ref(), Some(anchor));
+        }
+        assert_eq!(buf.iter_at_line(1).unwrap().child_anchor(), None);
+        assert_eq!(buffer_to_document(&buf).blocks, vec![p("x"), p("y")]);
+        // Reload clears the old anchors.
+        let anchors = load_into_buffer(&buf, &doc(vec![para(Normal, n, None, vec![Run::plain("z")])]));
+        assert!(anchors.is_empty());
+        assert_eq!(buffer_to_document(&buf).blocks, vec![p("z")]);
     }
 }
