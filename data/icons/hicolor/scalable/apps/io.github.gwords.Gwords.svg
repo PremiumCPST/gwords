@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="sheet" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#f6f5f4"/>
+    </linearGradient>
+  </defs>
+  <!-- Ombre portée -->
+  <path d="M32 20 H84 L104 40 V108 A8 8 0 0 1 96 116 H32 A8 8 0 0 1 24 108 V28 A8 8 0 0 1 32 20 Z"
+        fill="#000000" opacity="0.12" transform="translate(0 3)"/>
+  <!-- Feuille de papier avec coin replié -->
+  <path d="M32 16 H84 L104 36 V104 A8 8 0 0 1 96 112 H32 A8 8 0 0 1 24 104 V24 A8 8 0 0 1 32 16 Z"
+        fill="url(#sheet)" stroke="#deddda" stroke-width="2" stroke-linejoin="round"/>
+  <path d="M84 16 V28 A8 8 0 0 0 92 36 H104 Z" fill="#deddda"/>
+  <!-- Lignes de texte -->
+  <rect x="34" y="48" width="44" height="6" rx="3" fill="#3584e4" opacity="0.85"/>
+  <rect x="34" y="62" width="56" height="5" rx="2.5" fill="#deddda"/>
+  <rect x="34" y="74" width="48" height="5" rx="2.5" fill="#deddda"/>
+  <rect x="34" y="86" width="26" height="5" rx="2.5" fill="#deddda"/>
+  <!-- Plume et curseur bleus -->
+  <path d="M100 52 C 94 56, 88 64, 84 80 L 88 82 C 94 72, 98 62, 104 54 Z" fill="#3584e4"/>
+  <path d="M84 80 L 88 82 L 80 90 Z" fill="#1c71d8"/>
+  <rect x="62" y="84" width="3.5" height="14" rx="1.75" fill="#3584e4"/>
+</svg>

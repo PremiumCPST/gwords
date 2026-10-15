@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Gwords
+GenericName=Traitement de texte
+Comment[fr]=Rédiger et mettre en forme des documents texte
+Comment=Write and format text documents
+Exec=gwords %F
+Icon=io.github.gwords.Gwords
+Categories=GNOME;GTK;Office;WordProcessor;
+MimeType=application/vnd.oasis.opendocument.text;application/vnd.openxmlformats-officedocument.wordprocessingml.document;text/plain;
+StartupNotify=true
+Terminal=false

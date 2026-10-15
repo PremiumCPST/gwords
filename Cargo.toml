@@ -1,0 +1,17 @@
+[package]
+name = "gwords"
+version = "0.1.0"
+edition = "2024"
+description = "Traitement de texte pour GNOME (ODT, DOCX) écrit en Rust avec GTK 4 et libadwaita"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/PremiumCPST/gwords"
+readme = "README.md"
+keywords = ["gtk4", "libadwaita", "gnome", "odt", "docx"]
+categories = ["text-editors", "gui"]
+
+[dependencies]
+adw = { version = "0.9.2", package = "libadwaita", features = ["v1_7"] }
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_20"] }
+quick-xml = "0.42.0"
+thiserror = "2.0.21"
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
