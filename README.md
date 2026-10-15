@@ -15,35 +15,57 @@ accompagnent la frappe, la mise en forme et l'ouverture des documents.
   thème clair ou sombre
 - Intégration au bureau GNOME : fichier `.desktop`, métadonnées AppStream et icônes
 
-## Compilation et exécution
+## Installation
 
-Prérequis : Rust 1.85 ou plus récent (édition 2024), GTK 4.20 ou plus récent et libadwaita 1.7 ou plus récent,
-avec leurs paquets de développement.
+Gwords est distribué uniquement en **Flatpak**, ce qui le rend utilisable sur toutes les distributions
+Linux qui prennent en charge Flatpak. Il s'appuie sur le runtime GNOME 51 de Flathub.
+
+1. Téléchargez `gwords.flatpak` depuis la [dernière release](https://github.com/PremiumCPST/gwords/releases/latest).
+2. Installez-le (le runtime GNOME est récupéré automatiquement depuis Flathub) :
 
 ```sh
+flatpak install --user gwords.flatpak
+flatpak run io.github.gwords.Gwords
+```
+
+Gwords apparaît ensuite dans le menu des applications. L'application n'a aucun accès direct à vos
+fichiers : l'ouverture et l'enregistrement passent par les portails (les dialogues de fichiers du système).
+
+## Compilation depuis les sources
+
+Prérequis : `flatpak` et le dépôt Flathub.
+
+```sh
+flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install --user flathub org.flatpak.Builder org.gnome.Sdk//51 org.gnome.Platform//51 \
+    org.freedesktop.Sdk.Extension.rust-stable//26.08
+
 git clone https://github.com/PremiumCPST/gwords.git
 cd gwords
+flatpak run org.flatpak.Builder --user --install --force-clean build-dir io.github.gwords.Gwords.json
+flatpak run io.github.gwords.Gwords
 ```
 
-Sur Fedora Silverblue, on utilise une toolbox dédiée :
+Pour produire un paquet `gwords.flatpak` distribuable :
 
 ```sh
-toolbox create gwords-dev
-toolbox enter gwords-dev
-sudo dnf install rust cargo gtk4-devel libadwaita-devel gcc
-cargo run --release
+flatpak run org.flatpak.Builder --user --force-clean --repo=repo build-dir io.github.gwords.Gwords.json
+flatpak build-bundle repo gwords.flatpak io.github.gwords.Gwords \
+    --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo
 ```
 
-Sur une Fedora classique, installez les mêmes paquets avec `sudo dnf install`, puis lancez `cargo run --release`.
+### Dépendances Rust
 
-Pour installer l'application dans `~/.local` (binaire, fichier `.desktop`, métadonnées et icônes) :
+La construction Flatpak se fait hors ligne : les crates sont décrites dans `build-aux/cargo-sources.json`.
+Après toute modification de `Cargo.lock`, régénérez ce fichier avec
+[flatpak-cargo-generator](https://github.com/flatpak/flatpak-builder-tools/tree/master/cargo) :
 
 ```sh
-toolbox run -c gwords-dev ./install.sh
+python3 flatpak-cargo-generator.py Cargo.lock -o build-aux/cargo-sources.json
 ```
 
-Le script compile la version `release` et copie les fichiers ; il peut aussi être lancé directement
-sur un système où `cargo` est disponible.
+Pour développer sans Flatpak (avec Rust, GTK 4.20+ et libadwaita 1.7+ installés), `cargo run` et
+`cargo test` fonctionnent directement.
 
 ## Raccourcis clavier
 
